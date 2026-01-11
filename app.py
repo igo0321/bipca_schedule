@@ -7,7 +7,7 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 
 # ドキュメント生成用ライブラリ
@@ -17,7 +17,6 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.units import mm
 from docx import Document
-from docx.shared import Pt, Inches
 
 # ---------------------------------------------------------
 # 1. ユーティリティ関数（フォント設定など）
@@ -74,13 +73,11 @@ def send_email_with_attachment(zip_buffer, zip_filename, contest_name):
         msg.attach(part)
 
         # SMTPサーバーへの接続と送信
-        # Lolipop推奨のSSL接続 (ポート465) を使用
         if smtp_port == 465:
             with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
                 server.login(sender_email, sender_password)
                 server.send_message(msg)
         else:
-            # TLSの場合
             with smtplib.SMTP(smtp_server, smtp_port) as server:
                 server.starttls()
                 server.login(sender_email, sender_password)
@@ -287,19 +284,29 @@ def main():
             st.session_state.update(config_data)
             st.success("設定を復元しました")
 
-    # --- 1. Excelアップロード ---
+    # --- 1. Excelアップロードとシート選択 ---
     st.header("1. 名簿データのアップロード")
     uploaded_file = st.file_uploader("ExcelまたはCSVファイル", type=['xlsx', 'xls', 'csv'])
     
     if uploaded_file:
         try:
+            # CSVかExcelかで処理を分ける
             if uploaded_file.name.endswith('.csv'):
                 df = pd.read_csv(uploaded_file)
             else:
-                df = pd.read_excel(uploaded_file)
+                # ExcelFileとして読み込んでシート名を取得
+                xls = pd.ExcelFile(uploaded_file)
+                sheet_names = xls.sheet_names
+                
+                # シート選択ボックス
+                selected_sheet = st.selectbox("読み込むシートを選択してください", sheet_names)
+                
+                # 選択されたシートをDataFrameとして読み込む
+                df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
+
             st.write("データプレビュー:", df.head(3))
             
-            # --- 2. シート・列指定 ---
+            # --- 2. 列の割り当て ---
             st.header("2. 列の割り当て")
             cols = df.columns.tolist()
             
@@ -322,7 +329,6 @@ def main():
                     'category': row[col_cat],
                     'song': row[col_song],
                     'time_str': row[col_time]
-                    # 実際の時間計算ロジックはここに追加が必要（"2分30秒"などを数値に変換）
                 })
             
             # --- 3. スケジュール・グループ設定 ---
@@ -344,8 +350,6 @@ def main():
                     grp['start_time'] = c3.text_input(f"開始時刻 (G{i+1})", grp['start_time'], key=f"s_time_{i}")
                     grp['end_time'] = c4.text_input(f"終了時刻 (G{i+1})", grp['end_time'], key=f"e_time_{i}")
                     groups_config.append(grp)
-                    
-                    # ここで簡易的に番号範囲の該当者をカウントして表示するロジックを入れると親切
             
             # --- 4. 大会情報入力 ---
             st.header("4. 大会情報入力 (WP用・ファイル名用)")
