@@ -10,7 +10,6 @@ from email.mime.application import MIMEApplication
 from datetime import datetime
 import copy
 from docx import Document
-from docx.oxml import OxmlElement
 
 # ---------------------------------------------------------
 # 1. Word操作用ユーティリティ（行の複製・置換など）
@@ -29,25 +28,18 @@ def copy_table_row(table, row):
 def replace_text_in_paragraph(paragraph, replacements):
     """
     段落内のテキストを指定された辞書に基づいて置換する。
-    書式(Run)をなるべく維持するために、単純置換を行う。
     """
     for key, value in replacements.items():
         if key in paragraph.text:
-            # 簡易的な置換戦略: 
-            # 完全に一致するRunがあればそこで置換、なければテキスト全体を書き換える
-            # ※複雑な書式設定がある場合、キー文字が一つのRunに含まれている必要がある
             replaced = False
             for run in paragraph.runs:
                 if key in run.text:
                     run.text = run.text.replace(key, str(value))
                     replaced = True
             
-            # Run単位で置換できなかった場合（文字が分割されている場合など）
             if not replaced:
-                # 強引に全テキストを書き換える（書式の一部が失われる可能性があるが、文字化けよりマシ）
                 full_text = paragraph.text
                 new_text = full_text.replace(key, str(value))
-                # 最初のRunに全テキストを入れ、残りのRunをクリアする
                 if paragraph.runs:
                     paragraph.runs[0].text = new_text
                     for r in paragraph.runs[1:]:
@@ -72,14 +64,9 @@ def delete_row(table, row_idx):
 def generate_word_from_template(template_file, groups, all_data):
     """
     Wordテンプレートを読み込み、グループ設定とデータに基づいて行を増殖させる。
-    
-    template_file: UploadedFile object
-    groups: グループ設定のリスト [{'start_no':..., 'end_no':..., 'time_str':...}]
-    all_data: 名簿データのリスト
     """
     doc = Document(template_file)
     
-    # 最初の表を処理対象とする
     if not doc.tables:
         raise Exception("テンプレート内に表が見つかりません。")
     
@@ -89,7 +76,6 @@ def generate_word_from_template(template_file, groups, all_data):
     # 0行目: ヘッダー
     # 1行目: 時間区切り用の行（ひな形）
     # 2行目: データ表示用の行（ひな形）
-    # ※ユーザーのファイルに合わせてインデックスを指定
     
     if len(table.rows) < 3:
         raise Exception("テンプレートの表は少なくとも3行（ヘッダー、時間行、データ行）必要です。")
@@ -98,9 +84,7 @@ def generate_word_from_template(template_file, groups, all_data):
     time_row_template = table.rows[1]
     data_row_template = table.rows[2]
     
-    # ひな形行をテーブルから一旦削除する（後でコピーして追加するため）
-    # ※削除するとインデックスがずれるので、後ろから消すか、XML操作で消す
-    # ここでは、「コピー元」としてオブジェクトは保持しつつ、表からは消す
+    # ひな形行をテーブルから一旦削除する
     delete_row(table, 2) # データ行を削除
     delete_row(table, 1) # 時間行を削除
     
@@ -108,38 +92,34 @@ def generate_word_from_template(template_file, groups, all_data):
     for group in groups:
         # 1. 時間行を追加
         new_time_row = copy_table_row(table, time_row_template)
-        # 時間のテキストを置換（テンプレートが "13時00分～14時10分" となっている想定）
-        # テンプレート内の特定の文字を置換するか、セルを強制的に書き換えるか
-        # ここでは、セルの最初の段落をグループの時間設定で上書きする
+        # 時間のテキストを置換
         if group['time_str']:
-             # 結合されたセル対策: 最初のセルに書き込む
-            new_time_row.cells[0].paragraphs[0].text = group['time_str']
+            # セルの最初の段落を書き換える
+            if new_time_row.cells[0].paragraphs:
+                 new_time_row.cells[0].paragraphs[0].text = group['time_str']
+            else:
+                 new_time_row.cells[0].add_paragraph(group['time_str'])
 
         # 2. そのグループに該当するデータを抽出
-        # 文字列比較だと "A1" と "A10" の順序などが難しいが、今回はリスト順序通りに出力し、
-        # 範囲指定（開始～終了）にマッチするものだけを拾うロジックにする
-        
         target_members = []
         
-        # 範囲指定の判定ロジック
         s_no = group['start_no']
         e_no = group['end_no']
         
         in_range = False
-        # データがソートされている前提で、開始番号が見つかったら追加開始、終了番号が見つかったら終了
-        # 単純化のため、全データをスキャンして判定する
         
+        # 全データを走査して範囲内のメンバーを抽出
         for item in all_data:
-            # 番号が一致したらフラグを立てる等の処理
-            # 文字列としての完全一致で判定
             current_no = str(item['no'])
             
+            # 開始番号と一致したら範囲内フラグON
             if s_no and current_no == s_no:
                 in_range = True
             
             if in_range:
                 target_members.append(item)
             
+            # 終了番号と一致したら、この人を含めて終了（次回からOFF）
             if e_no and current_no == e_no:
                 in_range = False
         
@@ -147,17 +127,15 @@ def generate_word_from_template(template_file, groups, all_data):
         for member in target_members:
             new_data_row = copy_table_row(table, data_row_template)
             
-            # 置換用辞書の作成 (テンプレートのタグ {{ s.no }} などに対応)
+            # 置換用辞書の作成
             replacements = {
                 '{{ s.no }}': member['no'],
                 '{{ s.name }}': member['name'],
                 '{{ s.age }}': member.get('age', ''),
                 '{{ s.song }}': member['song'],
-                # その他必要な項目があればここに追加
             }
             fill_row_data(new_data_row, replacements)
 
-    # バッファに保存して返す
     output_buffer = io.BytesIO()
     doc.save(output_buffer)
     return output_buffer
@@ -238,16 +216,24 @@ def main():
             col_no = c1.selectbox("出場番号列", cols, index=cols.index("出場番号") if "出場番号" in cols else 0)
             col_name = c2.selectbox("氏名列", cols, index=cols.index("氏名") if "氏名" in cols else 0)
             col_song = c3.selectbox("曲目列", cols, index=cols.index("演奏曲目") if "演奏曲目" in cols else 0)
-            col_age = st.selectbox("年齢列 (任意)", ["(なし)"] + cols, index=cols.index("年齢")+1 if "年齢" in cols else 0)
+            
+            # 年齢列の選択（インデックス計算を修正済み）
+            default_age_idx = cols.index("年齢") + 1 if "年齢" in cols else 0
+            col_age = st.selectbox("年齢列 (任意)", ["(なし)"] + cols, index=default_age_idx)
             
             # データ変換
             all_data = []
             for _, row in df.iterrows():
+                # 年齢データの取得処理を修正
+                age_val = ""
+                if col_age != "(なし)":
+                    age_val = str(row[col_age])
+                
                 all_data.append({
-                    'no': str(row[col_no]), # 文字列として扱う
+                    'no': str(row[col_no]), 
                     'name': str(row[col_name]),
                     'song': str(row[col_song]),
-                    'age': str(row[col_age-1]) if col_age != "(なし)" else ""
+                    'age': age_val
                 })
 
             # --- 2. テンプレートアップロード ---
@@ -303,22 +289,17 @@ def main():
                     zip_buffer = io.BytesIO()
                     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
                         
-                        # テンプレートファイルをメモリに読み込む
-                        # UploadedFileは一度読むとポインタが進むので、都度seek(0)するかコピーする
-                        
                         # 1. 採点表 (審査員ごと)
                         for judge in judges_list:
                             if not judge: continue
                             uploaded_template.seek(0)
-                            # Word生成 (テンプレート処理)
                             try:
                                 doc_io = generate_word_from_template(uploaded_template, groups_config, all_data)
                                 zf.writestr(f"採点表_{judge}.docx", doc_io.getvalue())
                             except Exception as e:
                                 st.error(f"採点表生成エラー ({judge}): {e}")
 
-                        # 2. 受付表 (同じテンプレートで代用、もしくは別のテンプレートがあればそれを使う)
-                        # 今回は採点表テンプレートを使って「受付表.docx」も出す
+                        # 2. 受付表
                         uploaded_template.seek(0)
                         try:
                             doc_io = generate_word_from_template(uploaded_template, groups_config, all_data)
@@ -329,7 +310,6 @@ def main():
                         # 設定ファイル
                         zf.writestr("設定データ.json", config_json)
                     
-                    # 完了処理
                     st.success("生成完了！")
                     
                     # メール送信
