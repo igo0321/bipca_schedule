@@ -8,71 +8,186 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 from datetime import datetime
-import os
-
-# ドキュメント生成用ライブラリ
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.units import mm
+import copy
 from docx import Document
+from docx.oxml import OxmlElement
 
 # ---------------------------------------------------------
-# 1. ユーティリティ関数（フォント設定など）
+# 1. Word操作用ユーティリティ（行の複製・置換など）
 # ---------------------------------------------------------
-FONT_FILE = "ipaexg.ttf"
-FONT_NAME = "IPAexGothic"
 
-def register_font():
-    """PDF生成用の日本語フォントを登録する"""
-    if os.path.exists(FONT_FILE):
-        pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_FILE))
-        return True
-    else:
-        return False
+def copy_table_row(table, row):
+    """
+    表の指定された行（row）を、XMLレベルで複製して表の末尾に追加する。
+    スタイル（罫線、高さ、フォントなど）を維持する。
+    """
+    tbl = table._tbl
+    new_tr = copy.deepcopy(row._tr)
+    tbl.append(new_tr)
+    return table.rows[-1]
+
+def replace_text_in_paragraph(paragraph, replacements):
+    """
+    段落内のテキストを指定された辞書に基づいて置換する。
+    書式(Run)をなるべく維持するために、単純置換を行う。
+    """
+    for key, value in replacements.items():
+        if key in paragraph.text:
+            # 簡易的な置換戦略: 
+            # 完全に一致するRunがあればそこで置換、なければテキスト全体を書き換える
+            # ※複雑な書式設定がある場合、キー文字が一つのRunに含まれている必要がある
+            replaced = False
+            for run in paragraph.runs:
+                if key in run.text:
+                    run.text = run.text.replace(key, str(value))
+                    replaced = True
+            
+            # Run単位で置換できなかった場合（文字が分割されている場合など）
+            if not replaced:
+                # 強引に全テキストを書き換える（書式の一部が失われる可能性があるが、文字化けよりマシ）
+                full_text = paragraph.text
+                new_text = full_text.replace(key, str(value))
+                # 最初のRunに全テキストを入れ、残りのRunをクリアする
+                if paragraph.runs:
+                    paragraph.runs[0].text = new_text
+                    for r in paragraph.runs[1:]:
+                        r.text = ""
+
+def fill_row_data(row, data_dict):
+    """行内の全セルのテキストを置換データに基づいて更新する"""
+    for cell in row.cells:
+        for paragraph in cell.paragraphs:
+            replace_text_in_paragraph(paragraph, data_dict)
+
+def delete_row(table, row_idx):
+    """指定されたインデックスの行を削除する"""
+    tbl = table._tbl
+    tr = table.rows[row_idx]._tr
+    tbl.remove(tr)
 
 # ---------------------------------------------------------
-# 2. メール送信機能
+# 2. ドキュメント生成メインロジック
+# ---------------------------------------------------------
+
+def generate_word_from_template(template_file, groups, all_data):
+    """
+    Wordテンプレートを読み込み、グループ設定とデータに基づいて行を増殖させる。
+    
+    template_file: UploadedFile object
+    groups: グループ設定のリスト [{'start_no':..., 'end_no':..., 'time_str':...}]
+    all_data: 名簿データのリスト
+    """
+    doc = Document(template_file)
+    
+    # 最初の表を処理対象とする
+    if not doc.tables:
+        raise Exception("テンプレート内に表が見つかりません。")
+    
+    table = doc.tables[0]
+    
+    # テンプレート構造の前提:
+    # 0行目: ヘッダー
+    # 1行目: 時間区切り用の行（ひな形）
+    # 2行目: データ表示用の行（ひな形）
+    # ※ユーザーのファイルに合わせてインデックスを指定
+    
+    if len(table.rows) < 3:
+        raise Exception("テンプレートの表は少なくとも3行（ヘッダー、時間行、データ行）必要です。")
+
+    # ひな形の行を取得（参照を保持）
+    time_row_template = table.rows[1]
+    data_row_template = table.rows[2]
+    
+    # ひな形行をテーブルから一旦削除する（後でコピーして追加するため）
+    # ※削除するとインデックスがずれるので、後ろから消すか、XML操作で消す
+    # ここでは、「コピー元」としてオブジェクトは保持しつつ、表からは消す
+    delete_row(table, 2) # データ行を削除
+    delete_row(table, 1) # 時間行を削除
+    
+    # グループごとに処理
+    for group in groups:
+        # 1. 時間行を追加
+        new_time_row = copy_table_row(table, time_row_template)
+        # 時間のテキストを置換（テンプレートが "13時00分～14時10分" となっている想定）
+        # テンプレート内の特定の文字を置換するか、セルを強制的に書き換えるか
+        # ここでは、セルの最初の段落をグループの時間設定で上書きする
+        if group['time_str']:
+             # 結合されたセル対策: 最初のセルに書き込む
+            new_time_row.cells[0].paragraphs[0].text = group['time_str']
+
+        # 2. そのグループに該当するデータを抽出
+        # 文字列比較だと "A1" と "A10" の順序などが難しいが、今回はリスト順序通りに出力し、
+        # 範囲指定（開始～終了）にマッチするものだけを拾うロジックにする
+        
+        target_members = []
+        
+        # 範囲指定の判定ロジック
+        s_no = group['start_no']
+        e_no = group['end_no']
+        
+        in_range = False
+        # データがソートされている前提で、開始番号が見つかったら追加開始、終了番号が見つかったら終了
+        # 単純化のため、全データをスキャンして判定する
+        
+        for item in all_data:
+            # 番号が一致したらフラグを立てる等の処理
+            # 文字列としての完全一致で判定
+            current_no = str(item['no'])
+            
+            if s_no and current_no == s_no:
+                in_range = True
+            
+            if in_range:
+                target_members.append(item)
+            
+            if e_no and current_no == e_no:
+                in_range = False
+        
+        # 3. メンバーごとにデータ行を追加
+        for member in target_members:
+            new_data_row = copy_table_row(table, data_row_template)
+            
+            # 置換用辞書の作成 (テンプレートのタグ {{ s.no }} などに対応)
+            replacements = {
+                '{{ s.no }}': member['no'],
+                '{{ s.name }}': member['name'],
+                '{{ s.age }}': member.get('age', ''),
+                '{{ s.song }}': member['song'],
+                # その他必要な項目があればここに追加
+            }
+            fill_row_data(new_data_row, replacements)
+
+    # バッファに保存して返す
+    output_buffer = io.BytesIO()
+    doc.save(output_buffer)
+    return output_buffer
+
+# ---------------------------------------------------------
+# 3. メール送信機能
 # ---------------------------------------------------------
 def send_email_with_attachment(zip_buffer, zip_filename, contest_name):
-    """
-    作成したZIPファイルを添付して、指定されたアドレス（スタッフ）にメールを送信する
-    StreamlitのSecretsから設定を読み込む
-    """
     try:
-        # Secretsから設定を取得
+        if "email" not in st.secrets:
+             return False, "Secretsにメール設定がありません。"
+             
         smtp_server = st.secrets["email"]["smtp_server"]
         smtp_port = st.secrets["email"]["smtp_port"]
         sender_email = st.secrets["email"]["sender_email"]
         sender_password = st.secrets["email"]["sender_password"]
-        receiver_email = "info@beethoven-asia.com" # 送信先（スタッフ共有用）
+        receiver_email = "info@beethoven-asia.com"
 
-        # メールの作成
         msg = MIMEMultipart()
         msg['From'] = sender_email
         msg['To'] = receiver_email
         msg['Subject'] = f"【自動送信】資料出力: {contest_name}"
 
-        body = f"""
-        お疲れ様です。
-        
-        コンクール運営アプリより、以下の資料が出力されました。
-        ZIPファイルを添付します。
-        
-        ・コンクール名: {contest_name}
-        ・出力日時: {datetime.now().strftime('%Y/%m/%d %H:%M')}
-        
-        ※このメールは自動送信されています。
-        """
+        body = f"コンクール名: {contest_name}\n出力日時: {datetime.now().strftime('%Y/%m/%d %H:%M')}\n\n資料を添付します。"
         msg.attach(MIMEText(body, 'plain'))
 
-        # 添付ファイルの設定
         part = MIMEApplication(zip_buffer.getvalue(), Name=zip_filename)
         part['Content-Disposition'] = f'attachment; filename="{zip_filename}"'
         msg.attach(part)
 
-        # SMTPサーバーへの接続と送信
         if smtp_port == 465:
             with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
                 server.login(sender_email, sender_password)
@@ -84,198 +199,16 @@ def send_email_with_attachment(zip_buffer, zip_filename, contest_name):
                 server.send_message(msg)
         
         return True, "メール送信成功"
-    
     except Exception as e:
         return False, f"メール送信エラー: {str(e)}"
-
-# ---------------------------------------------------------
-# 3. ドキュメント生成関数群
-# ---------------------------------------------------------
-
-def create_schedule_pdf(data, output_buffer, title):
-    """受付表（スケジュール表）のPDFを作成"""
-    c = canvas.Canvas(output_buffer, pagesize=A4)
-    width, height = A4
-    
-    # フォント登録確認
-    if register_font():
-        c.setFont(FONT_NAME, 10)
-    
-    y = height - 20*mm
-    c.setFont(FONT_NAME, 16) if register_font() else None
-    c.drawString(20*mm, y, f"受付表: {title}")
-    y -= 15*mm
-    
-    c.setFont(FONT_NAME, 10) if register_font() else None
-    # ヘッダー
-    c.drawString(20*mm, y, "番号")
-    c.drawString(40*mm, y, "氏名")
-    c.drawString(90*mm, y, "部門")
-    c.drawString(130*mm, y, "演奏曲目")
-    y -= 5*mm
-    c.line(20*mm, y, 190*mm, y)
-    y -= 5*mm
-    
-    for item in data:
-        if y < 20*mm: # 改ページ
-            c.showPage()
-            y = height - 20*mm
-            c.setFont(FONT_NAME, 10) if register_font() else None
-        
-        c.drawString(20*mm, y, str(item.get('no', '')))
-        c.drawString(40*mm, y, str(item.get('name', '')))
-        c.drawString(90*mm, y, str(item.get('category', '')))
-        # 曲目は長いので省略などの処理が必要だが簡易的に表示
-        song = str(item.get('song', ''))[:20]
-        c.drawString(130*mm, y, song)
-        y -= 8*mm
-        
-    c.save()
-
-def create_score_sheet_pdf(data, output_buffer, judge_name, title):
-    """採点表のPDFを作成（審査員ごとに発行）"""
-    c = canvas.Canvas(output_buffer, pagesize=A4)
-    width, height = A4
-    if register_font():
-        c.setFont(FONT_NAME, 10)
-        
-    y = height - 20*mm
-    
-    # タイトルと審査員名
-    c.setFont(FONT_NAME, 14) if register_font() else None
-    c.drawString(20*mm, y, f"採点表: {title}")
-    c.setFont(FONT_NAME, 12) if register_font() else None
-    c.drawRightString(190*mm, y, f"審査員: {judge_name} 先生")
-    y -= 15*mm
-    
-    # 表ヘッダー
-    c.setFont(FONT_NAME, 10) if register_font() else None
-    c.drawString(20*mm, y, "番号")
-    c.drawString(35*mm, y, "氏名")
-    c.drawString(80*mm, y, "曲目")
-    c.drawString(140*mm, y, "点数・講評")
-    y -= 5*mm
-    c.line(20*mm, y, 190*mm, y)
-    y -= 10*mm
-    
-    for item in data:
-        if y < 40*mm:
-            c.showPage()
-            y = height - 20*mm
-            c.setFont(FONT_NAME, 12) if register_font() else None
-            c.drawRightString(190*mm, y, f"審査員: {judge_name} 先生")
-            y -= 15*mm
-            c.setFont(FONT_NAME, 10) if register_font() else None
-            
-        c.drawString(20*mm, y, str(item.get('no', '')))
-        c.drawString(35*mm, y, str(item.get('name', '')))
-        song = str(item.get('song', ''))[:15]
-        c.drawString(80*mm, y, song)
-        
-        # 記入欄枠
-        c.rect(140*mm, y - 15*mm, 50*mm, 20*mm)
-        
-        y -= 25*mm
-        
-    c.save()
-
-def create_word_doc(data, title, doc_type="list"):
-    """Wordファイルを作成（受付表、採点表、WP用など汎用）"""
-    doc = Document()
-    doc.add_heading(title, 0)
-    
-    if doc_type == "wp_schedule":
-        doc.add_paragraph("WordPress用スケジュールデータ")
-        table = doc.add_table(rows=1, cols=4)
-        table.style = 'Table Grid'
-        hdr_cells = table.rows[0].cells
-        hdr_cells[0].text = '時間'
-        hdr_cells[1].text = '番号'
-        hdr_cells[2].text = '氏名'
-        hdr_cells[3].text = '曲目'
-        
-        for item in data:
-            row_cells = table.add_row().cells
-            row_cells[0].text = str(item.get('time_slot', ''))
-            row_cells[1].text = str(item.get('no', ''))
-            row_cells[2].text = str(item.get('name', ''))
-            row_cells[3].text = str(item.get('song', ''))
-            
-    else:
-        # 汎用リスト（受付表など）
-        table = doc.add_table(rows=1, cols=3)
-        table.style = 'Table Grid'
-        hdr_cells = table.rows[0].cells
-        hdr_cells[0].text = '番号'
-        hdr_cells[1].text = '氏名'
-        hdr_cells[2].text = '部門'
-
-        for item in data:
-            row_cells = table.add_row().cells
-            row_cells[0].text = str(item.get('no', ''))
-            row_cells[1].text = str(item.get('name', ''))
-            row_cells[2].text = str(item.get('category', ''))
-
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    return buffer
-
-def create_summary_pdf(data, judge_list, output_buffer, title):
-    """集計表PDF（審査員全員の列を作る）"""
-    c = canvas.Canvas(output_buffer, pagesize=A4)
-    width, height = A4
-    if register_font():
-        c.setFont(FONT_NAME, 8)
-        
-    y = height - 20*mm
-    c.setFont(FONT_NAME, 14) if register_font() else None
-    c.drawString(20*mm, y, f"集計表: {title}")
-    y -= 15*mm
-    
-    # ヘッダー
-    c.setFont(FONT_NAME, 8) if register_font() else None
-    c.drawString(10*mm, y, "番号")
-    c.drawString(20*mm, y, "氏名")
-    
-    # 審査員列
-    x = 60*mm
-    col_width = 20*mm
-    for j_name in judge_list:
-        c.drawString(x, y, j_name[:4]) # 長いと重なるのでカット
-        x += col_width
-    c.drawString(x, y, "合計")
-    
-    y -= 5*mm
-    c.line(10*mm, y, width - 10*mm, y)
-    y -= 5*mm
-    
-    for item in data:
-        if y < 15*mm:
-            c.showPage()
-            y = height - 20*mm
-            c.setFont(FONT_NAME, 8) if register_font() else None
-            
-        c.drawString(10*mm, y, str(item.get('no', '')))
-        c.drawString(20*mm, y, str(item.get('name', '')))
-        
-        # 枠線だけ描画（点数書き込み用）
-        cur_x = 60*mm
-        for _ in judge_list:
-            c.rect(cur_x-2*mm, y-2*mm, 15*mm, 6*mm, fill=0)
-            cur_x += col_width
-        
-        y -= 8*mm
-        
-    c.save()
-
 
 # ---------------------------------------------------------
 # 4. メインアプリケーションUI
 # ---------------------------------------------------------
 def main():
-    st.title("🎹 コンクール運営資料作成 & スケジュール管理")
+    st.title("🎹 コンクール運営資料ジェネレーター (Word版)")
     
-    # --- サイドバー: 設定読み込み/保存 ---
+    # --- サイドバー: 設定読み込み ---
     with st.sidebar:
         st.header("⚙️ 設定管理")
         uploaded_config = st.file_uploader("設定ファイル(JSON)を読み込む", type=['json'])
@@ -284,158 +217,138 @@ def main():
             st.session_state.update(config_data)
             st.success("設定を復元しました")
 
-    # --- 1. Excelアップロードとシート選択 ---
-    st.header("1. 名簿データのアップロード")
-    uploaded_file = st.file_uploader("ExcelまたはCSVファイル", type=['xlsx', 'xls', 'csv'])
+    # --- 1. Excelアップロード ---
+    st.header("1. 名簿データ (Excel)")
+    uploaded_excel = st.file_uploader("名簿Excelファイルをアップロード", type=['xlsx', 'xls', 'csv'])
     
-    if uploaded_file:
+    if uploaded_excel:
         try:
-            # CSVかExcelかで処理を分ける
-            if uploaded_file.name.endswith('.csv'):
-                df = pd.read_csv(uploaded_file)
+            if uploaded_excel.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_excel)
             else:
-                # ExcelFileとして読み込んでシート名を取得
-                xls = pd.ExcelFile(uploaded_file)
-                sheet_names = xls.sheet_names
-                
-                # シート選択ボックス
-                selected_sheet = st.selectbox("読み込むシートを選択してください", sheet_names)
-                
-                # 選択されたシートをDataFrameとして読み込む
-                df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
+                xls = pd.ExcelFile(uploaded_excel)
+                sheet = st.selectbox("シートを選択", xls.sheet_names)
+                df = pd.read_excel(uploaded_excel, sheet_name=sheet)
 
             st.write("データプレビュー:", df.head(3))
             
-            # --- 2. 列の割り当て ---
-            st.header("2. 列の割り当て")
+            # 列の割り当て
             cols = df.columns.tolist()
+            c1, c2, c3 = st.columns(3)
+            col_no = c1.selectbox("出場番号列", cols, index=cols.index("出場番号") if "出場番号" in cols else 0)
+            col_name = c2.selectbox("氏名列", cols, index=cols.index("氏名") if "氏名" in cols else 0)
+            col_song = c3.selectbox("曲目列", cols, index=cols.index("演奏曲目") if "演奏曲目" in cols else 0)
+            col_age = st.selectbox("年齢列 (任意)", ["(なし)"] + cols, index=cols.index("年齢")+1 if "年齢" in cols else 0)
             
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                col_no = st.selectbox("出場番号の列", cols, index=cols.index("出場番号") if "出場番号" in cols else 0)
-                col_name = st.selectbox("氏名の列", cols, index=cols.index("氏名") if "氏名" in cols else 0)
-            with col2:
-                col_cat = st.selectbox("部門の列", cols, index=cols.index("出場部門") if "出場部門" in cols else 0)
-                col_song = st.selectbox("演奏曲目の列", cols, index=cols.index("演奏曲目") if "演奏曲目" in cols else 0)
-            with col3:
-                col_time = st.selectbox("演奏時間の列", cols, index=cols.index("演奏時間") if "演奏時間" in cols else 0)
-
-            # データを統一フォーマットに変換
-            processed_data = []
-            for index, row in df.iterrows():
-                processed_data.append({
-                    'no': row[col_no],
-                    'name': row[col_name],
-                    'category': row[col_cat],
-                    'song': row[col_song],
-                    'time_str': row[col_time]
+            # データ変換
+            all_data = []
+            for _, row in df.iterrows():
+                all_data.append({
+                    'no': str(row[col_no]), # 文字列として扱う
+                    'name': str(row[col_name]),
+                    'song': str(row[col_song]),
+                    'age': str(row[col_age-1]) if col_age != "(なし)" else ""
                 })
-            
-            # --- 3. スケジュール・グループ設定 ---
-            st.header("3. 進行スケジュール設定")
-            
+
+            # --- 2. テンプレートアップロード ---
+            st.header("2. Wordテンプレート")
+            st.info("2行目に「時間行」、3行目に「データ行({{ s.name }}等)」があるWordファイルをアップロードしてください。")
+            uploaded_template = st.file_uploader("Wordテンプレート (.docx)", type=['docx'])
+
+            # --- 3. スケジュール設定 ---
+            st.header("3. グループ・スケジュール設定")
             if 'groups' not in st.session_state:
-                st.session_state['groups'] = [{'start_no': '', 'end_no': '', 'start_time': '10:00', 'end_time': '11:00'}]
+                st.session_state['groups'] = [{'start_no': '', 'end_no': '', 'time_str': '13:00〜14:10'}]
             
-            # グループ追加ボタン
-            if st.button("＋ グループを追加"):
-                st.session_state['groups'].append({'start_no': '', 'end_no': '', 'start_time': '', 'end_time': ''})
+            if st.button("＋ グループ追加"):
+                st.session_state['groups'].append({'start_no': '', 'end_no': '', 'time_str': ''})
             
             groups_config = []
             for i, grp in enumerate(st.session_state['groups']):
                 with st.expander(f"グループ {i+1}", expanded=True):
-                    c1, c2, c3, c4 = st.columns(4)
-                    grp['start_no'] = c1.text_input(f"開始番号 (G{i+1})", grp['start_no'], key=f"s_no_{i}")
-                    grp['end_no'] = c2.text_input(f"終了番号 (G{i+1})", grp['end_no'], key=f"e_no_{i}")
-                    grp['start_time'] = c3.text_input(f"開始時刻 (G{i+1})", grp['start_time'], key=f"s_time_{i}")
-                    grp['end_time'] = c4.text_input(f"終了時刻 (G{i+1})", grp['end_time'], key=f"e_time_{i}")
+                    c1, c2, c3 = st.columns([1, 1, 2])
+                    grp['start_no'] = c1.text_input(f"開始番号", grp['start_no'], key=f"s_{i}")
+                    grp['end_no'] = c2.text_input(f"終了番号", grp['end_no'], key=f"e_{i}")
+                    grp['time_str'] = c3.text_input(f"表示時間 (例: 13:00〜14:10)", grp['time_str'], key=f"t_{i}")
                     groups_config.append(grp)
-            
-            # --- 4. 大会情報入力 ---
-            st.header("4. 大会情報入力 (WP用・ファイル名用)")
-            contest_name = st.text_input("コンクール名 (ファイル名に使用)", "第10回BIPCA 東京予選④")
-            open_time = st.text_input("開場時刻", "09:30")
-            reception_time = st.text_input("受付時刻", "09:30")
-            result_announce = st.text_input("審査結果発表日時", "当日 Webにて")
 
-            # --- 5. 審査員設定 ---
-            st.header("5. 審査員登録")
+            # --- 4. 審査員設定 ---
+            st.header("4. 審査員設定")
             if 'judges' not in st.session_state:
                 st.session_state['judges'] = ["審査員A"]
             
-            if st.button("＋ 審査員を追加"):
+            if st.button("＋ 審査員追加"):
                 st.session_state['judges'].append("")
             
-            updated_judges = []
-            for i, judge in enumerate(st.session_state['judges']):
-                val = st.text_input(f"審査員 {i+1} 氏名", judge, key=f"judge_{i}")
-                updated_judges.append(val)
-            st.session_state['judges'] = updated_judges
-
-            # --- 6. 出力・プレビュー ---
-            st.header("6. ファイル出力とメール送信")
+            judges_list = []
+            for i, j in enumerate(st.session_state['judges']):
+                judges_list.append(st.text_input(f"審査員 {i+1}", j, key=f"j_{i}"))
+            st.session_state['judges'] = judges_list
             
-            # 設定保存用データの作成
-            config_export = {
-                'contest_name': contest_name,
-                'groups': groups_config,
-                'judges': updated_judges
-            }
-            config_json = json.dumps(config_export, ensure_ascii=False, indent=2)
+            # コンクール名
+            contest_name = st.text_input("コンクール名 (ファイル名用)", "第10回BIPCA 東京予選④")
 
-            if st.button("全ファイル生成 & メール送信"):
-                # ZIPファイルの作成
-                zip_buffer = io.BytesIO()
-                
-                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                    
-                    # 1. 受付表 PDF
-                    pdf_buf = io.BytesIO()
-                    create_schedule_pdf(processed_data, pdf_buf, contest_name)
-                    zip_file.writestr("受付表.pdf", pdf_buf.getvalue())
-                    
-                    # 2. 受付表 Word
-                    word_buf = create_word_doc(processed_data, f"受付表: {contest_name}")
-                    zip_file.writestr("受付表.docx", word_buf.getvalue())
-                    
-                    # 3. 採点表 (審査員分)
-                    for j_name in updated_judges:
-                        if j_name: # 空欄でなければ
-                            score_buf = io.BytesIO()
-                            create_score_sheet_pdf(processed_data, score_buf, j_name, contest_name)
-                            zip_file.writestr(f"採点表_{j_name}.pdf", score_buf.getvalue())
-                    
-                    # 4. WP用 Word
-                    wp_data = processed_data # 実際はスケジュールでフィルタリングしたデータを使う
-                    wp_buf = create_word_doc(wp_data, contest_name, doc_type="wp_schedule")
-                    zip_file.writestr("HP公開用スケジュール.docx", wp_buf.getvalue())
-                    
-                    # 5. 集計表 PDF
-                    summary_buf = io.BytesIO()
-                    create_summary_pdf(processed_data, updated_judges, summary_buf, contest_name)
-                    zip_file.writestr("集計表.pdf", summary_buf.getvalue())
-                    
-                    # 6. 設定ファイル
-                    zip_file.writestr("設定データ.json", config_json)
-
-                # メール送信処理
-                is_sent, mail_msg = send_email_with_attachment(zip_buffer, f"{contest_name}.zip", contest_name)
-                
-                if is_sent:
-                    st.success(f"メール送信完了: {mail_msg}")
+            # --- 5. 出力 ---
+            if st.button("ファイル生成を実行"):
+                if not uploaded_template:
+                    st.error("Wordテンプレートをアップロードしてください。")
                 else:
-                    st.error(mail_msg)
-                
-                # ダウンロードボタンの表示
-                st.download_button(
-                    label="ZIPファイルをダウンロード",
-                    data=zip_buffer.getvalue(),
-                    file_name=f"{contest_name}.zip",
-                    mime="application/zip"
-                )
+                    # 設定保存データの作成
+                    config_json = json.dumps({
+                        'groups': groups_config,
+                        'judges': judges_list,
+                        'contest_name': contest_name
+                    }, ensure_ascii=False, indent=2)
+
+                    zip_buffer = io.BytesIO()
+                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        
+                        # テンプレートファイルをメモリに読み込む
+                        # UploadedFileは一度読むとポインタが進むので、都度seek(0)するかコピーする
+                        
+                        # 1. 採点表 (審査員ごと)
+                        for judge in judges_list:
+                            if not judge: continue
+                            uploaded_template.seek(0)
+                            # Word生成 (テンプレート処理)
+                            try:
+                                doc_io = generate_word_from_template(uploaded_template, groups_config, all_data)
+                                zf.writestr(f"採点表_{judge}.docx", doc_io.getvalue())
+                            except Exception as e:
+                                st.error(f"採点表生成エラー ({judge}): {e}")
+
+                        # 2. 受付表 (同じテンプレートで代用、もしくは別のテンプレートがあればそれを使う)
+                        # 今回は採点表テンプレートを使って「受付表.docx」も出す
+                        uploaded_template.seek(0)
+                        try:
+                            doc_io = generate_word_from_template(uploaded_template, groups_config, all_data)
+                            zf.writestr("受付表.docx", doc_io.getvalue())
+                        except Exception as e:
+                            pass
+
+                        # 設定ファイル
+                        zf.writestr("設定データ.json", config_json)
+                    
+                    # 完了処理
+                    st.success("生成完了！")
+                    
+                    # メール送信
+                    sent, msg = send_email_with_attachment(zip_buffer, f"{contest_name}.zip", contest_name)
+                    if sent:
+                        st.info(f"メール送信完了: {msg}")
+                    else:
+                        st.warning(msg)
+                    
+                    # ダウンロード
+                    st.download_button(
+                        "ZIPファイルをダウンロード",
+                        zip_buffer.getvalue(),
+                        f"{contest_name}.zip",
+                        "application/zip"
+                    )
 
         except Exception as e:
-            st.error(f"エラーが発生しました: {e}")
+            st.error(f"予期せぬエラー: {e}")
 
 if __name__ == "__main__":
     main()
