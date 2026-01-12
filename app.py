@@ -74,14 +74,13 @@ def calculate_next_day_morning(date_str):
     """開催日から翌日10:00の文字列を生成"""
     if not date_str:
         return ""
-    # 2025年12月21日 などの形式から数字を抽出
     match = re.search(r'(\d{4})[^\d](\d{1,2})[^\d](\d{1,2})', str(date_str))
     if match:
         try:
             year, month, day = map(int, match.groups())
             dt = datetime(year, month, day)
             next_day = dt + timedelta(days=1)
-            return next_day.strftime(f"%Y年%m月%d日10時00分") # ゼロ埋めは許容範囲とする
+            return next_day.strftime(f"%Y年%m月%d日10時00分")
         except:
             return ""
     return ""
@@ -125,15 +124,30 @@ def copy_table_row(table, row):
     return table.rows[-1]
 
 def replace_text_in_paragraph(paragraph, replacements):
+    """
+    段落内のテキストを置換する。
+    ★修正: 書式(Run)を維持するため、Run単位で検索・置換を行う。
+    """
     for key, value in replacements.items():
         if key in paragraph.text:
-            full_text = paragraph.text
-            new_text = full_text.replace(key, str(value))
-            if paragraph.runs:
-                r = paragraph.runs[0]
-                r.text = new_text
-                for sub_r in paragraph.runs[1:]:
-                    sub_r.text = ""
+            # Run単位でループして置換を試みる（書式維持のため）
+            replaced_in_run = False
+            for run in paragraph.runs:
+                if key in run.text:
+                    run.text = run.text.replace(key, str(value))
+                    replaced_in_run = True
+            
+            # もしRun単位で置換できなかった場合（タグが複数のRunにまたがっている場合など）
+            # やむを得ず段落全体を書き換えるが、これだと書式が飛ぶ可能性がある。
+            # 基本的にはユーザー側でタグを一気に入力してもらうことで回避する。
+            if not replaced_in_run:
+                # 念のためのフォールバック（以前のロジックに近い）
+                full_text = paragraph.text
+                new_text = full_text.replace(key, str(value))
+                if paragraph.runs:
+                    paragraph.runs[0].text = new_text
+                    for sub_r in paragraph.runs[1:]:
+                        sub_r.text = ""
 
 def fill_row_data(row, data_dict):
     for cell in row.cells:
@@ -167,6 +181,7 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
         global_replacements[f"{{{{ {k} }}}}"] = v
     replace_text_in_document_body(doc, global_replacements)
 
+    # 表処理（採点表・WEBプログラム共通）
     if not doc.tables:
         output_buffer = io.BytesIO()
         doc.save(output_buffer)
@@ -174,39 +189,80 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
     
     table = doc.tables[0]
     
-    if len(table.rows) < 3:
-        output_buffer = io.BytesIO()
-        doc.save(output_buffer)
-        return output_buffer
-
-    time_row_template = table.rows[1]
-    data_row_template = table.rows[2]
-    
-    delete_row(table, 2)
-    delete_row(table, 1)
-    
-    for group in groups:
-        # 1. 時間行
-        new_time_row = copy_table_row(table, time_row_template)
-        raw_time = group['time_str']
-        formatted_time = format_time_label(raw_time)
-        fill_row_data(new_time_row, {'{{ time }}': formatted_time})
-
-        # 2. メンバー解決
-        target_members = resolve_participants_from_string(group['member_input'], all_data)
+    # テンプレート構造チェック: 最低3行必要（ヘッダー、時間行、データ行）
+    # WEBプログラムもこの形式に合わせてください
+    if len(table.rows) >= 3:
+        time_row_template = table.rows[1]
+        data_row_template = table.rows[2]
         
-        # 3. データ行
-        for member in target_members:
-            new_data_row = copy_table_row(table, data_row_template)
-            replacements = {
-                '{{ s.no }}': member['no'],
-                '{{ s.name }}': member['name'],
-                '{{ s.kana }}': member.get('kana', ''),
-                '{{ s.age }}': member.get('age', ''),
-                '{{ s.tel }}': member.get('tel', ''),
-                '{{ s.song }}': member['song'],
-            }
-            fill_row_data(new_data_row, replacements)
+        # ひな形行を削除
+        delete_row(table, 2)
+        delete_row(table, 1)
+        
+        for group in groups:
+            # 1. 時間行
+            new_time_row = copy_table_row(table, time_row_template)
+            raw_time = group['time_str']
+            formatted_time = format_time_label(raw_time)
+            fill_row_data(new_time_row, {'{{ time }}': formatted_time})
+
+            # 2. メンバー解決
+            target_members = resolve_participants_from_string(group['member_input'], all_data)
+            
+            # 3. データ行
+            for member in target_members:
+                new_data_row = copy_table_row(table, data_row_template)
+                replacements = {
+                    '{{ s.no }}': member['no'],
+                    '{{ s.name }}': member['name'],
+                    '{{ s.kana }}': member.get('kana', ''),
+                    '{{ s.age }}': member.get('age', ''),
+                    '{{ s.tel }}': member.get('tel', ''),
+                    '{{ s.song }}': member['song'],
+                }
+                fill_row_data(new_data_row, replacements)
+
+    output_buffer = io.BytesIO()
+    doc.save(output_buffer)
+    return output_buffer
+
+
+def generate_judges_list_doc(template_path_or_file, judges_list, global_context):
+    """
+    審査員一覧を作成する関数
+    表の中に {{ judge_name }} がある行を探し、人数分複製する
+    """
+    doc = Document(template_path_or_file)
+
+    # 全体情報の置換
+    global_replacements = {}
+    for k, v in global_context.items():
+        global_replacements[f"{{{{ {k} }}}}"] = v
+    replace_text_in_document_body(doc, global_replacements)
+
+    if doc.tables:
+        table = doc.tables[0]
+        target_row_idx = -1
+        
+        # {{ judge_name }} を含む行を探す
+        for i, row in enumerate(table.rows):
+            for cell in row.cells:
+                if "{{ judge_name }}" in cell.text:
+                    target_row_idx = i
+                    break
+            if target_row_idx != -1:
+                break
+        
+        if target_row_idx != -1:
+            template_row = table.rows[target_row_idx]
+            
+            # 審査員数分ループ
+            for judge in judges_list:
+                new_row = copy_table_row(table, template_row)
+                fill_row_data(new_row, {'{{ judge_name }}': judge})
+            
+            # 元のひな形行を削除
+            delete_row(table, target_row_idx)
 
     output_buffer = io.BytesIO()
     doc.save(output_buffer)
@@ -311,7 +367,9 @@ def main():
             
             score_template_path = None
             reception_template_path = None
-            web_template_path = None # WEBプログラム用
+            web_template_path = None
+            judges_list_template_path = None # 審査員リスト用
+            
             use_manual_upload = False
 
             if template_files:
@@ -319,12 +377,15 @@ def main():
                 idx_score = 0
                 idx_reception = 0
                 idx_web = 0
+                idx_judges = 0
                 for i, f in enumerate(template_files):
                     if "採点表" in f: idx_score = i
                     if "受付表" in f: idx_reception = i
                     if "WEB" in f or "プログラム" in f: idx_web = i
+                    if "審査員" in f and "リスト" not in f: idx_judges = i # 「本日の審査員」など
                 
-                col_t1, col_t2, col_t3 = st.columns(3)
+                col_t1, col_t2 = st.columns(2)
+                col_t3, col_t4 = st.columns(2)
                 
                 with col_t1:
                     selected_score_file = st.selectbox("採点表テンプレート", template_files, index=idx_score)
@@ -337,6 +398,10 @@ def main():
                 with col_t3:
                     selected_web_file = st.selectbox("WEBプログラムテンプレート", template_files, index=idx_web)
                     web_template_path = os.path.join(TEMPLATE_DIR, selected_web_file)
+
+                with col_t4:
+                    selected_judges_file = st.selectbox("審査員リストテンプレート", template_files, index=idx_judges)
+                    judges_list_template_path = os.path.join(TEMPLATE_DIR, selected_judges_file)
                 
                 if st.checkbox("テンプレートを手動でアップロードする"):
                     use_manual_upload = True
@@ -345,10 +410,12 @@ def main():
                 use_manual_upload = True
 
             if use_manual_upload:
-                c_up1, c_up2, c_up3 = st.columns(3)
+                c_up1, c_up2 = st.columns(2)
+                c_up3, c_up4 = st.columns(2)
                 uploaded_score_template = c_up1.file_uploader("採点表テンプレート (.docx)", type=['docx'])
                 uploaded_reception_template = c_up2.file_uploader("受付表テンプレート (.docx)", type=['docx'])
                 uploaded_web_template = c_up3.file_uploader("WEBプログラムテンプレート (.docx)", type=['docx'])
+                uploaded_judges_template = c_up4.file_uploader("審査員リストテンプレート (.docx)", type=['docx'])
                 
                 if uploaded_score_template:
                     score_template_path = uploaded_score_template
@@ -356,6 +423,8 @@ def main():
                     reception_template_path = uploaded_reception_template
                 if uploaded_web_template:
                     web_template_path = uploaded_web_template
+                if uploaded_judges_template:
+                    judges_list_template_path = uploaded_judges_template
 
             # --- 3. グループ・スケジュール設定 ---
             st.header("3. グループ・スケジュール設定")
@@ -459,7 +528,6 @@ def main():
             st.header("5. 審査会詳細")
             st.info("※ここで入力した内容はWord出力時に自動的に形式変換されて挿入されます。")
             
-            # 詳細データ保存用
             if 'contest_details' not in st.session_state:
                 st.session_state['contest_details'] = {
                     'date': '', 'hall': '', 'open': '10:00', 'reception': '10:45-15:30',
@@ -469,7 +537,6 @@ def main():
             det = st.session_state['contest_details']
 
             def on_date_change():
-                """開催日が変更されたら結果発表日時を翌日10時に自動更新"""
                 current_date = st.session_state['detail_date']
                 calculated = calculate_next_day_morning(current_date)
                 if calculated:
@@ -486,7 +553,6 @@ def main():
             det['reception'] = col_d6.text_input("受付時間 (例: 10:45-15:30)", value=det['reception'])
 
             col_d7, col_d8 = st.columns(2)
-            # 結果発表は入力欄だが、stateと紐付けて更新させる
             det['result'] = col_d7.text_input("結果発表日時 (自動計算)", value=det['result'])
             
             det['method'] = col_d8.selectbox("結果発表方式", [
@@ -506,15 +572,16 @@ def main():
                     return
                 if not web_template_path:
                     st.warning("WEBプログラムテンプレートが選択されていません。WEBプログラムは生成されません。")
-                
+                if not judges_list_template_path:
+                    st.warning("審査員リストテンプレートが選択されていません。")
+
                 valid_judges = [j for j in st.session_state['judges'] if j.strip()]
                 
-                # 詳細情報の整形（タグ挿入用）
                 details_formatted = {
                     'contest_date': det['date'],
                     'contest_hall': det['hall'],
                     'contest_open': format_single_time_label(det['open']),
-                    'contest_reception': format_time_label(det['reception']), # 範囲
+                    'contest_reception': format_time_label(det['reception']),
                     'contest_start': format_single_time_label(det['start']),
                     'contest_end': format_single_time_label(det['end']),
                     'contest_result': det['result'],
@@ -531,10 +598,9 @@ def main():
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
                     
-                    # 共通コンテキスト作成
                     base_context = {
                         'contest_name': contest_name,
-                        **details_formatted # 詳細情報をマージ
+                        **details_formatted
                     }
 
                     # 1. 採点表生成
@@ -571,11 +637,30 @@ def main():
                                 web_template_path.seek(0)
                             
                             context = base_context.copy()
-                            context['judge_name'] = '' # プログラムには審査員名は不要な場合が多い
+                            context['judge_name'] = ''
                             doc_io = generate_word_from_template(web_template_path, st.session_state['groups'], all_data, context)
                             zf.writestr("WEBプログラム.docx", doc_io.getvalue())
                         except Exception as e:
                             st.error(f"WEBプログラム生成エラー: {e}")
+                            
+                    # 4. 審査員リスト生成 (New)
+                    if judges_list_template_path:
+                         try:
+                            if hasattr(judges_list_template_path, 'seek'):
+                                judges_list_template_path.seek(0)
+                            
+                            context = base_context.copy()
+                            doc_io = generate_judges_list_doc(judges_list_template_path, valid_judges, context)
+                            zf.writestr("本日の審査員.docx", doc_io.getvalue())
+                         except Exception as e:
+                            st.error(f"審査員リスト生成エラー: {e}")
+
+                    # 5. PDFファイルの同梱 (New)
+                    if os.path.exists(TEMPLATE_DIR):
+                        pdf_files = [f for f in os.listdir(TEMPLATE_DIR) if f.endswith(".pdf")]
+                        for pdf_file in pdf_files:
+                            pdf_path = os.path.join(TEMPLATE_DIR, pdf_file)
+                            zf.write(pdf_path, arcname=pdf_file)
 
                     # 設定ファイル
                     zf.writestr("設定データ.json", config_json)
