@@ -574,6 +574,8 @@ def main():
         st.header("⚙️ 設定管理")
         uploaded_config = st.file_uploader("設定ファイル(JSON)を読み込む", type=['json'])
         if uploaded_config:
+            # 修正: ファイルポインタを先頭に戻す処理を追加
+            uploaded_config.seek(0)
             config_data = json.load(uploaded_config)
             st.session_state.update(config_data)
             st.success("設定を復元しました")
