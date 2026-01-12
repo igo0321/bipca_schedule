@@ -4,6 +4,7 @@ import io
 import zipfile
 import json
 import smtplib
+import re  # 正規表現用に追加
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
@@ -12,23 +13,38 @@ import copy
 from docx import Document
 
 # ---------------------------------------------------------
-# 1. Word操作用ユーティリティ（行の複製・置換など）
+# 1. ユーティリティ（時間変換・Word操作）
 # ---------------------------------------------------------
 
+def format_time_label(text):
+    """
+    入力された時間文字列（例: 13:00-14:10, 13:00〜14:10）から
+    数字を抽出して「13時00分～14時10分」の形式に変換する。
+    マッチしない場合は元のテキストを返す。
+    """
+    if not text:
+        return ""
+    # 数字1〜2桁 + コロン + 数字2桁 を探す (全角コロンも対応)
+    matches = re.findall(r'(\d{1,2})[:：](\d{2})', str(text))
+    
+    # 開始と終了の2つが見つかった場合のみ変換
+    if len(matches) >= 2:
+        start_time = f"{matches[0][0]}時{matches[0][1]}分"
+        end_time = f"{matches[1][0]}時{matches[1][1]}分"
+        return f"{start_time}～{end_time}"
+    else:
+        return text
+
 def copy_table_row(table, row):
-    """
-    表の指定された行（row）を、XMLレベルで複製して表の末尾に追加する。
-    スタイル（罫線、高さ、フォントなど）を維持する。
-    """
+    """表の行を複製して末尾に追加"""
     tbl = table._tbl
     new_tr = copy.deepcopy(row._tr)
     tbl.append(new_tr)
     return table.rows[-1]
 
 def replace_text_in_paragraph(paragraph, replacements):
-    """
-    段落内のテキストを指定された辞書に基づいて置換する。
-    """
+    """段落内のテキストを置換"""
+    # 完全に一致するRunがあれば置換（書式維持のため）
     for key, value in replacements.items():
         if key in paragraph.text:
             replaced = False
@@ -37,6 +53,8 @@ def replace_text_in_paragraph(paragraph, replacements):
                     run.text = run.text.replace(key, str(value))
                     replaced = True
             
+            # Run単位で置換できなかった場合、段落全体を書き換え
+            # (注意: 途中で書式が変わっていると書式がリセットされる場合があります)
             if not replaced:
                 full_text = paragraph.text
                 new_text = full_text.replace(key, str(value))
@@ -46,31 +64,63 @@ def replace_text_in_paragraph(paragraph, replacements):
                         r.text = ""
 
 def fill_row_data(row, data_dict):
-    """行内の全セルのテキストを置換データに基づいて更新する"""
+    """行内の全セルのテキストを置換"""
     for cell in row.cells:
         for paragraph in cell.paragraphs:
             replace_text_in_paragraph(paragraph, data_dict)
 
 def delete_row(table, row_idx):
-    """指定されたインデックスの行を削除する"""
+    """指定行を削除"""
     tbl = table._tbl
     tr = table.rows[row_idx]._tr
     tbl.remove(tr)
+
+def replace_text_in_document_body(doc, replacements):
+    """
+    表以外の本文やヘッダー内のテキストを置換する
+    """
+    # 1. 本文の段落
+    for paragraph in doc.paragraphs:
+        replace_text_in_paragraph(paragraph, replacements)
+    
+    # 2. ヘッダー/フッター（セクションごと）
+    for section in doc.sections:
+        # ヘッダー
+        for paragraph in section.header.paragraphs:
+            replace_text_in_paragraph(paragraph, replacements)
+        # フッター
+        for paragraph in section.footer.paragraphs:
+            replace_text_in_paragraph(paragraph, replacements)
 
 # ---------------------------------------------------------
 # 2. ドキュメント生成メインロジック
 # ---------------------------------------------------------
 
-def generate_word_from_template(template_file, groups, all_data):
+def generate_word_from_template(template_file, groups, all_data, global_context):
     """
-    Wordテンプレートを読み込み、グループ設定とデータに基づいて行を増殖させる。
+    template_file: Wordテンプレート
+    groups: グループ設定リスト
+    all_data: Excelから読み込んだ参加者データリスト
+    global_context: { 'contest_name': '...', 'judge_name': '...' } などの共通情報
     """
     doc = Document(template_file)
     
-    if not doc.tables:
-        raise Exception("テンプレート内に表が見つかりません。")
+    # --- A. 全体情報の置換（ヘッダーやタイトルなど） ---
+    # 置換用タグの作成 (例: {{ contest_name }})
+    global_replacements = {}
+    for k, v in global_context.items():
+        global_replacements[f"{{{{ {k} }}}}"] = v  # {{ key }} 形式に変換
     
-    table = doc.tables[0]
+    replace_text_in_document_body(doc, global_replacements)
+
+    # --- B. 表データの生成 ---
+    if not doc.tables:
+        # 表がない場合でもエラーにせず、そのまま返す（表紙だけの場合など考慮）
+        output_buffer = io.BytesIO()
+        doc.save(output_buffer)
+        return output_buffer
+    
+    table = doc.tables[0] # 最初の表を対象とする
     
     # テンプレート構造の前提:
     # 0行目: ヘッダー
@@ -80,46 +130,38 @@ def generate_word_from_template(template_file, groups, all_data):
     if len(table.rows) < 3:
         raise Exception("テンプレートの表は少なくとも3行（ヘッダー、時間行、データ行）必要です。")
 
-    # ひな形の行を取得（参照を保持）
+    # ひな形の行を参照・コピーしておく
     time_row_template = table.rows[1]
     data_row_template = table.rows[2]
     
-    # ひな形行をテーブルから一旦削除する
-    delete_row(table, 2) # データ行を削除
-    delete_row(table, 1) # 時間行を削除
+    # ひな形行をテーブルから削除
+    delete_row(table, 2)
+    delete_row(table, 1)
     
     # グループごとに処理
     for group in groups:
         # 1. 時間行を追加
         new_time_row = copy_table_row(table, time_row_template)
-        # 時間のテキストを置換
-        if group['time_str']:
-            # セルの最初の段落を書き換える
-            if new_time_row.cells[0].paragraphs:
-                 new_time_row.cells[0].paragraphs[0].text = group['time_str']
-            else:
-                 new_time_row.cells[0].add_paragraph(group['time_str'])
+        
+        # 時間文字列の変換処理
+        raw_time = group['time_str']
+        formatted_time = format_time_label(raw_time)
+        
+        # 時間行の中にある {{ time }} タグを置換
+        fill_row_data(new_time_row, {'{{ time }}': formatted_time})
 
         # 2. そのグループに該当するデータを抽出
         target_members = []
-        
         s_no = group['start_no']
         e_no = group['end_no']
-        
         in_range = False
         
-        # 全データを走査して範囲内のメンバーを抽出
         for item in all_data:
             current_no = str(item['no'])
-            
-            # 開始番号と一致したら範囲内フラグON
             if s_no and current_no == s_no:
                 in_range = True
-            
             if in_range:
                 target_members.append(item)
-            
-            # 終了番号と一致したら、この人を含めて終了（次回からOFF）
             if e_no and current_no == e_no:
                 in_range = False
         
@@ -127,10 +169,11 @@ def generate_word_from_template(template_file, groups, all_data):
         for member in target_members:
             new_data_row = copy_table_row(table, data_row_template)
             
-            # 置換用辞書の作成
+            # データ行の置換辞書
             replacements = {
                 '{{ s.no }}': member['no'],
                 '{{ s.name }}': member['name'],
+                '{{ s.kana }}': member.get('kana', ''), # フリガナ追加
                 '{{ s.age }}': member.get('age', ''),
                 '{{ s.song }}': member['song'],
             }
@@ -141,13 +184,13 @@ def generate_word_from_template(template_file, groups, all_data):
     return output_buffer
 
 # ---------------------------------------------------------
-# 3. メール送信機能
+# 3. メール送信機能 (変更なし)
 # ---------------------------------------------------------
 def send_email_with_attachment(zip_buffer, zip_filename, contest_name):
+    # (既存のコードと同じため省略しませんが、スペース節約のため中身は変更なし)
     try:
         if "email" not in st.secrets:
              return False, "Secretsにメール設定がありません。"
-             
         smtp_server = st.secrets["email"]["smtp_server"]
         smtp_port = st.secrets["email"]["smtp_port"]
         sender_email = st.secrets["email"]["sender_email"]
@@ -158,7 +201,6 @@ def send_email_with_attachment(zip_buffer, zip_filename, contest_name):
         msg['From'] = sender_email
         msg['To'] = receiver_email
         msg['Subject'] = f"【自動送信】資料出力: {contest_name}"
-
         body = f"コンクール名: {contest_name}\n出力日時: {datetime.now().strftime('%Y/%m/%d %H:%M')}\n\n資料を添付します。"
         msg.attach(MIMEText(body, 'plain'))
 
@@ -175,7 +217,6 @@ def send_email_with_attachment(zip_buffer, zip_filename, contest_name):
                 server.starttls()
                 server.login(sender_email, sender_password)
                 server.send_message(msg)
-        
         return True, "メール送信成功"
     except Exception as e:
         return False, f"メール送信エラー: {str(e)}"
@@ -212,39 +253,49 @@ def main():
             
             # 列の割り当て
             cols = df.columns.tolist()
-            c1, c2, c3 = st.columns(3)
-            col_no = c1.selectbox("出場番号列", cols, index=cols.index("出場番号") if "出場番号" in cols else 0)
-            col_name = c2.selectbox("氏名列", cols, index=cols.index("氏名") if "氏名" in cols else 0)
-            col_song = c3.selectbox("曲目列", cols, index=cols.index("演奏曲目") if "演奏曲目" in cols else 0)
+            c1, c2, c3, c4 = st.columns(4)
+            col_no = c1.selectbox("出場番号", cols, index=cols.index("出場番号") if "出場番号" in cols else 0)
+            col_name = c2.selectbox("氏名", cols, index=cols.index("氏名") if "氏名" in cols else 0)
             
-            # 年齢列の選択（インデックス計算を修正済み）
+            # フリガナ列 (任意)
+            default_kana_idx = cols.index("フリガナ") if "フリガナ" in cols else 0
+            col_kana = c3.selectbox("フリガナ (任意)", ["(なし)"] + cols, index=default_kana_idx if "フリガナ" in cols else 0)
+            
+            col_song = c4.selectbox("演奏曲目", cols, index=cols.index("演奏曲目") if "演奏曲目" in cols else 0)
+            
+            # 年齢列 (任意)
             default_age_idx = cols.index("年齢") + 1 if "年齢" in cols else 0
             col_age = st.selectbox("年齢列 (任意)", ["(なし)"] + cols, index=default_age_idx)
             
             # データ変換
             all_data = []
             for _, row in df.iterrows():
-                # 年齢データの取得処理を修正
-                age_val = ""
-                if col_age != "(なし)":
-                    age_val = str(row[col_age])
+                # 任意の列の取得
+                age_val = str(row[col_age]) if col_age != "(なし)" else ""
+                kana_val = str(row[col_kana]) if col_kana != "(なし)" else ""
                 
                 all_data.append({
                     'no': str(row[col_no]), 
                     'name': str(row[col_name]),
+                    'kana': kana_val,
                     'song': str(row[col_song]),
                     'age': age_val
                 })
 
             # --- 2. テンプレートアップロード ---
             st.header("2. Wordテンプレート")
-            st.info("2行目に「時間行」、3行目に「データ行({{ s.name }}等)」があるWordファイルをアップロードしてください。")
+            st.info("""
+            以下のタグが使用可能です：
+            - 文書全体: {{ contest_name }}, {{ judge_name }}
+            - 表の時間行: {{ time }}
+            - 表のデータ行: {{ s.no }}, {{ s.name }}, {{ s.kana }}, {{ s.age }}, {{ s.song }}
+            """)
             uploaded_template = st.file_uploader("Wordテンプレート (.docx)", type=['docx'])
 
             # --- 3. スケジュール設定 ---
             st.header("3. グループ・スケジュール設定")
             if 'groups' not in st.session_state:
-                st.session_state['groups'] = [{'start_no': '', 'end_no': '', 'time_str': '13:00〜14:10'}]
+                st.session_state['groups'] = [{'start_no': '', 'end_no': '', 'time_str': '13:00-14:10'}]
             
             if st.button("＋ グループ追加"):
                 st.session_state['groups'].append({'start_no': '', 'end_no': '', 'time_str': ''})
@@ -255,7 +306,7 @@ def main():
                     c1, c2, c3 = st.columns([1, 1, 2])
                     grp['start_no'] = c1.text_input(f"開始番号", grp['start_no'], key=f"s_{i}")
                     grp['end_no'] = c2.text_input(f"終了番号", grp['end_no'], key=f"e_{i}")
-                    grp['time_str'] = c3.text_input(f"表示時間 (例: 13:00〜14:10)", grp['time_str'], key=f"t_{i}")
+                    grp['time_str'] = c3.text_input(f"時間 (例: 13:00-14:10)", grp['time_str'], key=f"t_{i}")
                     groups_config.append(grp)
 
             # --- 4. 審査員設定 ---
@@ -269,10 +320,10 @@ def main():
             judges_list = []
             for i, j in enumerate(st.session_state['judges']):
                 judges_list.append(st.text_input(f"審査員 {i+1}", j, key=f"j_{i}"))
-            st.session_state['judges'] = judges_list
+            st.session_state['judges'] = [j for j in judges_list if j] # 空白除去
             
             # コンクール名
-            contest_name = st.text_input("コンクール名 (ファイル名用)", "第10回BIPCA 東京予選④")
+            contest_name = st.text_input("コンクール名 (ファイル名・置換用)", "第10回BIPCA 東京予選④")
 
             # --- 5. 出力 ---
             if st.button("ファイル生成を実行"):
@@ -290,22 +341,19 @@ def main():
                     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
                         
                         # 1. 採点表 (審査員ごと)
-                        for judge in judges_list:
-                            if not judge: continue
+                        for judge in st.session_state['judges']:
                             uploaded_template.seek(0)
                             try:
-                                doc_io = generate_word_from_template(uploaded_template, groups_config, all_data)
+                                # コンテキスト（共通情報）の作成
+                                context = {
+                                    'contest_name': contest_name,
+                                    'judge_name': judge
+                                }
+                                
+                                doc_io = generate_word_from_template(uploaded_template, groups_config, all_data, context)
                                 zf.writestr(f"採点表_{judge}.docx", doc_io.getvalue())
                             except Exception as e:
                                 st.error(f"採点表生成エラー ({judge}): {e}")
-
-                        # 2. 受付表
-                        uploaded_template.seek(0)
-                        try:
-                            doc_io = generate_word_from_template(uploaded_template, groups_config, all_data)
-                            zf.writestr("受付表.docx", doc_io.getvalue())
-                        except Exception as e:
-                            pass
 
                         # 設定ファイル
                         zf.writestr("設定データ.json", config_json)
