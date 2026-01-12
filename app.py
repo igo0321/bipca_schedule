@@ -109,54 +109,72 @@ def resolve_participants_from_string(input_str, all_data_list):
                 resolved_members.append(all_data_list[idx])
     return resolved_members
 
-# --- Word操作系 ---
+# --- Word操作系（修正版：スマート置換） ---
 
-def simple_replace_text(paragraph, replacements):
+def replace_text_smart(paragraph, replacements):
     """
-    書式を壊さないように、Run単位で単純置換を行う。
-    タグが複数のRunにまたがっている場合は置換できないが、
-    Wordテンプレート側でタグを一気に入力していれば通常は1つのRunになる。
+    強力な置換関数。
+    1. まずRunごとの単純置換を試みる（スタイル維持）。
+    2. それで置換しきれない（タグが分割されている）場合、
+       段落内のテキストを強制的に結合して置換する（確実性優先）。
     """
-    if not paragraph.runs:
+    full_text = paragraph.text
+    # 置換対象のキーがそもそも含まれていなければ何もしない
+    if not any(key in full_text for key in replacements):
         return
 
-    # 高速化のための事前チェック
-    text = paragraph.text
-    has_key = False
-    for k in replacements:
-        if k in text:
-            has_key = True
-            break
-    if not has_key:
-        return
+    # 1. 単純置換トライ（スタイル維持のため）
+    if paragraph.runs:
+        for run in paragraph.runs:
+            for key, val in replacements.items():
+                if key in run.text:
+                    run.text = run.text.replace(key, str(val))
 
-    for run in paragraph.runs:
-        for key, value in replacements.items():
-            if key in run.text:
-                # 単純置換（書式維持）
-                run.text = run.text.replace(key, str(value))
+    # 2. 残存チェックと強制置換（Fallback）
+    # 単純置換後もまだキーが残っている＝タグがRunを跨いで分割されている
+    full_text_new = paragraph.text
+    remaining_keys = [k for k in replacements if k in full_text_new]
+
+    if remaining_keys:
+        # 強制結合モード
+        # 注意: 最初のRunのスタイルが全体に適用される可能性がありますが、
+        # タグがそのまま残るよりは良いという判断です。
+        
+        # 現在のテキストを取得して一括置換
+        current_text = full_text_new
+        for k in remaining_keys:
+            current_text = current_text.replace(k, str(replacements[k]))
+        
+        # 全Runをクリア
+        for run in paragraph.runs:
+            run.text = ""
+        
+        # 最初のRunに置換後テキストを設定（なければ作る）
+        if paragraph.runs:
+            paragraph.runs[0].text = current_text
+        else:
+            paragraph.add_run(current_text)
 
 def fill_row_data(row, data_dict):
     """行内の全セルの段落に対して置換を実行"""
     for cell in row.cells:
         for paragraph in cell.paragraphs:
-            simple_replace_text(paragraph, data_dict)
+            replace_text_smart(paragraph, data_dict)
 
 def replace_text_in_document_full(doc, replacements):
     """
     ドキュメント全体（本文段落＋全テーブル内のセル）を対象に置換を行う。
-    ※ヘッダー・フッターは今回は対象外としているが、必要なら追加可能。
     """
     # 1. 本文段落
     for paragraph in doc.paragraphs:
-        simple_replace_text(paragraph, replacements)
+        replace_text_smart(paragraph, replacements)
     
     # 2. 表の中の段落（ここが重要：スケジュール表などはここにある）
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for paragraph in cell.paragraphs:
-                    simple_replace_text(paragraph, replacements)
+                    replace_text_smart(paragraph, replacements)
 
 # ---------------------------------------------------------
 # 2. ドキュメント生成メインロジック
@@ -164,11 +182,11 @@ def replace_text_in_document_full(doc, replacements):
 
 def generate_word_from_template(template_path_or_file, groups, all_data, global_context):
     """
-    採点表・受付表用（シンプルな1行1データ型）
+    採点表・受付表用
     """
     doc = Document(template_path_or_file)
     
-    # グローバル変数の置換（表の中も含めて実施）
+    # グローバル変数の置換
     global_replacements = {}
     for k, v in global_context.items():
         global_replacements[f"{{{{ {k} }}}}"] = v
@@ -227,6 +245,7 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
                     '{{ s.name }}': member['name'],
                     '{{ s.kana }}': member.get('kana', ''),
                     '{{ s.age }}': member.get('age', ''),
+                    '{{ s.tel }}': member.get('tel', ''),
                     '{{ s.song }}': member['song'],
                 }
                 fill_row_data(new_data_row, replacements)
@@ -238,8 +257,7 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
 
 def generate_web_program_doc(template_path_or_file, groups, all_data, global_context):
     """
-    WEBプログラム用（段落(時間)＋表(データ) のセットを繰り返す）
-    ★重要: 2行で1セット（結合セル対応）のロジックを実装
+    WEBプログラム用（2行セット対応＋スマート置換）
     """
     doc = Document(template_path_or_file)
     
@@ -252,16 +270,12 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
     template_time_para = None
     template_data_table = None
     
-    # 時間段落を探す
     for p in doc.paragraphs:
         if "{{ time }}" in p.text:
             template_time_para = p
             break
             
     if template_time_para:
-        # 時間段落の直後にある表を探す（XML要素順）
-        # python-docxで直後の要素を特定するのは難しいため、
-        # "全テーブルの中で、中身に {{ s.no }} を含む最初の表" をテンプレートとみなすのが現実的
         for table in doc.tables:
             txt = ""
             for r in table.rows:
@@ -277,7 +291,6 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
             template_tbl_xml = copy.deepcopy(template_data_table._tbl)
             
             # --- テンプレート要素の削除 ---
-            # 本文から削除
             parent_body = template_time_para._element.getparent()
             if parent_body is not None:
                 parent_body.remove(template_time_para._p)
@@ -287,85 +300,59 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
                 parent_tbl.remove(template_data_table._tbl)
             
             # --- 出場者行テンプレートの抽出（2行セット対応） ---
-            # テーブルXMLの中から、{{ s.no }} を含む行を探し、
-            # 「その行」と「次の行」をセットでテンプレートとする（結合セル対策）
+            data_tr_list = []
+            header_tr_list = []
             
-            # 一時的にDocxオブジェクトとして解析するためにダミー処理は重いので、
-            # XML構造（tr）を直接操作する
-            
-            data_tr_list = [] # テンプレートとなるtr要素のリスト
-            header_tr_list = [] # ヘッダーがあれば保持
-            
-            # 行を走査してテンプレート部分を特定
-            # XML操作のため、python-docxのRowオブジェクトではなく tr要素を追う
             temp_rows = list(template_tbl_xml.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr'))
             
             start_index = -1
-            rows_per_entry = 2 # デフォルトで2行セットと仮定（ユーザー指定に基づく）
+            rows_per_entry = 2 # 2行1セット
 
             for i, tr in enumerate(temp_rows):
-                # tr内のテキストを簡易抽出
-                xml_str = str(tr.xml) if hasattr(tr, 'xml') else "" 
-                # python-docxのxmlプロパティは直接取れない場合があるため、lxml要素として扱う
-                # ここでは簡易的に、テキスト検索で特定する
                 text_content = "".join([t.text for t in tr.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t')])
                 
                 if "{{ s.no }}" in text_content:
                     start_index = i
                     break
                 else:
-                    header_tr_list.append(tr) # データ行より前はヘッダーとみなす
+                    header_tr_list.append(tr)
 
             if start_index != -1:
-                # テンプレートとして start_index から rows_per_entry 分を取得
-                # もし範囲外ならあるだけ取得
                 end_index = min(start_index + rows_per_entry, len(temp_rows))
                 data_tr_list = temp_rows[start_index : end_index]
             
-            # テーブルの中身（行）を空にする（ヘッダー以外）
-            # XML上で子要素を削除
+            # テーブルの中身をクリア
             for tr in temp_rows:
                 template_tbl_xml.remove(tr)
             
-            # --- ループ生成 ---
-            # 追加先（通常はbodyの末尾に追加していく）
             doc_body = doc._body._element
             
             for group in groups:
                 # 1. 時間段落の追加
                 new_p_xml = copy.deepcopy(template_p_xml)
                 doc_body.append(new_p_xml)
-                # 内容書き換え
                 new_para = Paragraph(new_p_xml, doc._body)
                 raw_time = group['time_str']
                 formatted_time = format_time_label(raw_time)
-                simple_replace_text(new_para, {'{{ time }}': formatted_time})
+                replace_text_smart(new_para, {'{{ time }}': formatted_time})
                 
                 # 2. テーブルの追加
                 new_tbl_xml = copy.deepcopy(template_tbl_xml)
                 doc_body.append(new_tbl_xml)
                 
-                # ヘッダー行を復元
+                # ヘッダー行復元
                 for h_tr in header_tr_list:
                     new_tbl_xml.append(copy.deepcopy(h_tr))
                 
-                # メンバー行を追加
+                # メンバー行追加
                 target_members = resolve_participants_from_string(group['member_input'], all_data)
                 
                 for member in target_members:
-                    # テンプレート行セット（2行分）をコピーして追加
                     for tr_template in data_tr_list:
                         new_tr = copy.deepcopy(tr_template)
                         new_tbl_xml.append(new_tr)
                         
-                        # 追加した行に対して置換実行
-                        # XMLからRowオブジェクトを作れないため、
-                        # テーブル全体を再取得して、末尾の行を操作するのが安全だが遅い。
-                        # ここでは「テーブルの末尾に追加された」前提で、
-                        # doc.tables[-1] の rows[-1] を触る。
-                        
-                        # 注意: doc.tablesはキャッシュされることがあるが、
-                        # python-docxは通常アクセス時に要素を取得し直す。
+                        # 置換実行
                         current_table = doc.tables[-1] 
                         current_row = current_table.rows[-1]
                         
@@ -378,10 +365,9 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
                         }
                         fill_row_data(current_row, replacements)
 
-                # グループ間に空行を入れる（任意）
                 doc_body.append(copy.deepcopy(template_p_xml))
                 last_p = Paragraph(doc_body[-1], doc._body)
-                last_p.text = "" # 空行
+                last_p.text = "" 
 
     output_buffer = io.BytesIO()
     doc.save(output_buffer)
@@ -395,7 +381,7 @@ def generate_judges_list_doc(template_path_or_file, judges_list, global_context)
         global_replacements[f"{{{{ {k} }}}}"] = v
     replace_text_in_document_full(doc, global_replacements)
 
-    # パターン1: 表
+    # 表パターン
     for table in doc.tables:
         target_row_idx = -1
         for i, row in enumerate(table.rows):
@@ -418,7 +404,7 @@ def generate_judges_list_doc(template_path_or_file, judges_list, global_context)
             doc.save(output_buffer)
             return output_buffer
 
-    # パターン2: 段落
+    # 段落パターン
     target_para = None
     for para in doc.paragraphs:
         if "{{ judge_name }}" in para.text:
@@ -441,7 +427,7 @@ def generate_judges_list_doc(template_path_or_file, judges_list, global_context)
             new_p_xml = copy.deepcopy(template_p_xml)
             doc._body._body.append(new_p_xml)
             new_para = Paragraph(new_p_xml, parent)
-            simple_replace_text(new_para, {'{{ judge_name }}': judge})
+            replace_text_smart(new_para, {'{{ judge_name }}': judge})
 
     output_buffer = io.BytesIO()
     doc.save(output_buffer)
