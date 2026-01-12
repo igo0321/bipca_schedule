@@ -5,7 +5,7 @@ import zipfile
 import json
 import smtplib
 import re
-import os  # ファイル操作用に追加
+import os
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
@@ -133,9 +133,6 @@ def replace_text_in_document_body(doc, replacements):
 # ---------------------------------------------------------
 
 def generate_word_from_template(template_path_or_file, groups, all_data, global_context):
-    """
-    template_path_or_file: ファイルパス(str) または アップロードされたファイルオブジェクト
-    """
     doc = Document(template_path_or_file)
     
     # 全体情報の置換
@@ -152,7 +149,6 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
     table = doc.tables[0]
     
     if len(table.rows) < 3:
-        # テーブル行数が足りない場合の安全策（表紙のみテンプレートなどの可能性）
         output_buffer = io.BytesIO()
         doc.save(output_buffer)
         return output_buffer
@@ -181,7 +177,7 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
                 '{{ s.name }}': member['name'],
                 '{{ s.kana }}': member.get('kana', ''),
                 '{{ s.age }}': member.get('age', ''),
-                '{{ s.tel }}': member.get('tel', ''),  # 電話番号対応
+                '{{ s.tel }}': member.get('tel', ''),
                 '{{ s.song }}': member['song'],
             }
             fill_row_data(new_data_row, replacements)
@@ -197,7 +193,6 @@ def send_email_with_attachment(zip_buffer, zip_filename, contest_name):
     try:
         if "email" not in st.secrets:
              return False, "Secretsにメール設定がありません。"
-        # 実装省略（変更なし）
         return True, "メール送信(ダミー)成功" 
     except Exception as e:
         return False, str(e)
@@ -244,7 +239,7 @@ def main():
             
             col_song = c4.selectbox("演奏曲目", cols, index=cols.index("演奏曲目") if "演奏曲目" in cols else 0)
             
-            # 追加オプション列 (電話番号追加)
+            # 追加オプション列
             c5, c6, c7 = st.columns(3)
             
             default_age = cols.index("年齢") if "年齢" in cols else -1
@@ -262,7 +257,7 @@ def main():
             for _, row in df.iterrows():
                 kana_val = str(row[col_kana]) if col_kana != "(なし)" else ""
                 age_val = str(row[col_age]) if col_age != "(なし)" else ""
-                tel_val = str(row[col_tel]) if col_tel != "(なし)" else "" # 電話番号取得
+                tel_val = str(row[col_tel]) if col_tel != "(なし)" else ""
                 
                 dur_seconds = 0
                 if col_duration != "(なし)":
@@ -298,7 +293,6 @@ def main():
             if template_files:
                 col_t1, col_t2 = st.columns(2)
                 
-                # デフォルト値の自動検出
                 idx_score = 0
                 idx_reception = 0
                 for i, f in enumerate(template_files):
@@ -313,14 +307,12 @@ def main():
                     selected_reception_file = st.selectbox("受付表テンプレート", template_files, index=idx_reception)
                     reception_template_path = os.path.join(TEMPLATE_DIR, selected_reception_file)
                 
-                # 手動アップロードへの切り替えオプション
                 if st.checkbox("テンプレートを手動でアップロードする"):
                     use_manual_upload = True
             else:
                 st.warning("templatesフォルダが見つからないか、docxファイルがありません。手動アップロードモードに切り替えます。")
                 use_manual_upload = True
 
-            # 手動アップロード (フォールバック)
             if use_manual_upload:
                 c_up1, c_up2 = st.columns(2)
                 uploaded_score_template = c_up1.file_uploader("採点表テンプレート (.docx)", type=['docx'])
@@ -353,10 +345,10 @@ def main():
 
             st.button("＋ グループ追加", on_click=add_group)
 
-           for i, grp in enumerate(st.session_state['groups']):
+            # グループ一覧表示ループ
+            for i, grp in enumerate(st.session_state['groups']):
                 c_sort, c_input, c_total, c_time, c_del = st.columns([0.8, 3, 1.2, 2, 0.5])
                 
-                # --- 並べ替えボタン ---
                 with c_sort:
                     if st.button("▲", key=f"up_{i}"):
                         move_group_up(i)
@@ -365,7 +357,6 @@ def main():
                         move_group_down(i)
                         st.rerun()
 
-                # --- メンバー指定入力 ---
                 input_val = c_input.text_input(
                     f"グループ {i+1} 対象番号",
                     value=grp['member_input'],
@@ -374,17 +365,16 @@ def main():
                 )
                 st.session_state['groups'][i]['member_input'] = input_val
 
-                # --- 合計時間計算 & 表示 (レイアウト修正版) ---
+                # 合計時間計算
                 current_members = resolve_participants_from_string(input_val, all_data)
                 total_sec = sum(m['duration_sec'] for m in current_members)
                 time_display = format_seconds_to_jp_label(total_sec)
                 
                 with c_total:
-                    # HTML/CSSで入力欄と高さを完全に合わせた青いボックスを作成
-                    # height: 45px程度がStreamlitのinput boxに近い高さです
+                    # HTML/CSSでレイアウト調整
                     st.markdown(f"""
                     <div style="margin-bottom: 0px;">
-                        <label style="font-size: 14px; color: rgb(49, 51, 63); margin-bottom: 8px; display: block;">
+                        <label style="font-size: 14px; color: rgb(49, 51, 63); margin-bottom: 0.5rem; display: block;">
                             合計演奏時間
                         </label>
                         <div style="
@@ -392,18 +382,19 @@ def main():
                             border: 1px solid rgba(28, 131, 225, 0.1);
                             border-radius: 0.5rem;
                             padding: 0px 10px;
-                            height: 42px;
+                            min-height: 2.5rem; /* Streamlitのinput boxに近い高さ */
+                            height: auto;
                             display: flex;
                             align-items: center;
                             color: rgb(0, 66, 128);
                             font-size: 1rem;
+                            line-height: 1.5;
                         ">
                             計: {time_display}
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
 
-                # --- 時間設定入力 ---
                 time_val = c_time.text_input(
                     "時間",
                     value=grp['time_str'],
@@ -412,11 +403,9 @@ def main():
                 )
                 st.session_state['groups'][i]['time_str'] = time_val
 
-                # --- 削除ボタン ---
                 with c_del:
-                    # ボタン位置を少し下げるためのスペーサー（任意）
-                    st.write("") 
-                    st.write("")
+                    # スペース調整
+                    st.markdown("<div style='margin-top: 1.8rem;'></div>", unsafe_allow_html=True)
                     if st.button("×", key=f"del_{i}"):
                         remove_group(i)
                         st.rerun()
@@ -438,14 +427,10 @@ def main():
 
             # --- 5. 出力 ---
             if st.button("ファイル生成を実行", type="primary"):
-                # テンプレートチェック
                 if not score_template_path:
                     st.error("採点表テンプレートが選択されていません。")
                     return
-                # 受付表は任意ではなく必須とする場合はチェックを追加
-                if not reception_template_path:
-                    st.warning("受付表テンプレートが選択されていません。受付表は生成されません。")
-
+                
                 valid_judges = [j for j in st.session_state['judges'] if j.strip()]
                 
                 config_json = json.dumps({
@@ -457,11 +442,9 @@ def main():
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
                     
-                    # 1. 採点表生成 (審査員ごと)
+                    # 1. 採点表生成
                     for judge in valid_judges:
                         try:
-                            # ファイルパスかアップロードオブジェクトかで分岐せずに済むよう関数側で対応済み
-                            # ただしアップロードオブジェクトの場合はポインタを戻す必要がある
                             if hasattr(score_template_path, 'seek'):
                                 score_template_path.seek(0)
                             
@@ -471,13 +454,12 @@ def main():
                         except Exception as e:
                             st.error(f"採点表生成エラー ({judge}): {e}")
 
-                    # 2. 受付表生成 (1回のみ)
+                    # 2. 受付表生成
                     if reception_template_path:
                         try:
                             if hasattr(reception_template_path, 'seek'):
                                 reception_template_path.seek(0)
                             
-                            # 受付表用コンテキスト（審査員名は不要だがコンクール名は渡す）
                             context = {'contest_name': contest_name, 'judge_name': '受付用'}
                             doc_io = generate_word_from_template(reception_template_path, st.session_state['groups'], all_data, context)
                             zf.writestr("受付表.docx", doc_io.getvalue())
