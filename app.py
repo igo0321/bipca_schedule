@@ -50,7 +50,6 @@ def format_seconds_to_jp_label(total_seconds):
         return f"{m}分"
 
 def format_time_label(text):
-    """範囲（～）付きの時間変換"""
     if not text:
         return ""
     matches = re.findall(r'(\d{1,2})[:：](\d{2})', str(text))
@@ -62,7 +61,6 @@ def format_time_label(text):
         return text
 
 def format_single_time_label(text):
-    """単発の時間変換 (例: 10:00 -> 10時00分)"""
     if not text:
         return ""
     match = re.search(r'(\d{1,2})[:：](\d{2})', str(text))
@@ -71,7 +69,6 @@ def format_single_time_label(text):
     return text
 
 def calculate_next_day_morning(date_str):
-    """開催日から翌日10:00の文字列を生成"""
     if not date_str:
         return ""
     match = re.search(r'(\d{4})[^\d](\d{1,2})[^\d](\d{1,2})', str(date_str))
@@ -118,108 +115,83 @@ def resolve_participants_from_string(input_str, all_data_list):
 # --- Word操作系 ---
 
 def copy_table_row(table, row):
-    """表の行を複製"""
     tbl = table._tbl
     new_tr = copy.deepcopy(row._tr)
     tbl.append(new_tr)
     return table.rows[-1]
 
-def duplicate_paragraph(paragraph, insert_after=True):
-    """段落をスタイルごと複製して挿入"""
-    p_element = paragraph._p
-    new_p_element = copy.deepcopy(p_element)
-    if insert_after:
-        p_element.addnext(new_p_element)
-    else:
-        p_element.addprevious(new_p_element)
-    return Paragraph(new_p_element, paragraph._parent)
-
-def replace_text_in_paragraph_robust(paragraph, replacements):
+def replace_text_in_paragraph_merged(paragraph, replacements):
     """
-    【修正版】書式(Run)を維持したまま、タグが分割されていても正しく置換するロジック
+    【修正版】タグが分割されていても、Runを結合して正しく置換するロジック。
+    文字位置計算のズレを防ぐため、単純化して処理する。
     """
+    # まずテキスト全体にキーが含まれているか確認（高速化）
     full_text = paragraph.text
-    
-    # 置換対象がなければ何もしない（高速化）
-    any_key = False
-    for k in replacements:
-        if k in full_text:
-            any_key = True
-            break
-    if not any_key:
+    if not any(k in full_text for k in replacements):
         return
 
-    # 1. まず単純なRun内置換を試みる（タグが分割されていない場合用）
+    # キーが含まれている場合、Runの構造を整理する
+    # シンプルな戦略: 全テキストを取得し、置換を行い、それを「最初のRun」に入れて、残りのRunをクリアする
+    # ★重要: これだと書式が「最初のRun」のものに統一されてしまうが、
+    # タグ（{{ ... }}）の途中で書式が変わることは稀であると仮定する。
+    # むしろ変に計算して壊れるより安全。
+    
+    # ただし、タグ以外の場所（例: "開場: " の太字部分）まで巻き込まないように注意が必要。
+    # よって、「タグ部分だけ」を特定して、その範囲のRunをマージする処理が必要だが、
+    # WordのXML構造上、インデックス計算はリスクが高い。
+    
+    # 折衷案: 
+    # 段落内のテキストをスキャンし、タグが見つかったら、そのタグを構成しているRun群を特定して書き換える。
+    
+    # 簡易実装（フェールセーフ）:
+    # もしタグがそのまま1つのRunに入っていれば単純置換（これが理想）
     for key, value in replacements.items():
         for run in paragraph.runs:
             if key in run.text:
                 run.text = run.text.replace(key, str(value))
-    
-    # 2. タグが分割されている場合の処理（Runをまたぐ置換）
-    full_text = paragraph.text # 更新されたテキストを再取得
+                
+    # 分割されている場合の処理
+    # XML操作を行わず、python-docxのレベルで解決を試みる
+    # テキスト全体を再取得
+    full_text = paragraph.text
     for key, value in replacements.items():
         if key in full_text:
-            # キーの開始位置と終了位置を探す
-            start_idx = full_text.find(key)
-            if start_idx == -1: continue # すでに置換済み
+            # まだ置換されていない（＝分割されている）
             
-            end_idx = start_idx + len(key)
+            # 戦略: 
+            # 1. 全Runのテキストをリスト化
+            # 2. 結合文字列上で置換を実行
+            # 3. 置換後の文字列を、最初のRunに書き戻し、以降のRunをクリア...
+            #    これだと段落全体の書式が最初のもので統一されてしまう。
+            #    → "開場: {{ time }}" の場合、"開場: "の書式が適用されるならOKだが、
+            #      もし "開場: " がRun1(Bold), "{{ time }}" がRun2(Normal) だとすると、Run1に統合されるとBoldになる。
             
-            # 各Runがどの文字インデックス範囲を担当しているか調べる
-            current_idx = 0
-            runs_to_modify = []
+            # 今回の不具合（{{ cont...）は、インデックス計算のズレが原因。
+            # 安全策として、「段落内の全Runを統合して1つにする」処理を行う。
+            # 書式の細かい混在（1行の中で赤と青が混ざるなど）は犠牲になる可能性があるが、
+            # 文字化けやタグ破損よりはマシである。
             
-            for run in paragraph.runs:
-                run_len = len(run.text)
-                run_start = current_idx
-                run_end = current_idx + run_len
+            # ただし、極力既存のテキスト（タグ以外）を守るため、
+            # 「タグを含むRunの範囲」だけを統合したい。
+            
+            runs = paragraph.runs
+            if not runs: continue
+            
+            # 全結合して置換
+            new_text = full_text.replace(key, str(value))
+            
+            # 全Runをクリア
+            for run in runs:
+                run.text = ""
                 
-                # キーと重なっているRunを特定
-                if run_end > start_idx and run_start < end_idx:
-                    runs_to_modify.append((run, run_start, run_end))
-                
-                current_idx += run_len
-            
-            if not runs_to_modify: continue
-
-            # 置換戦略:
-            # 最初のRunに「前の残り + 値」を入れ、最後のRunに「後ろの残り」を入れる。
-            # 間のRunは空にする。
-            
-            first_run_info = runs_to_modify[0]
-            last_run_info = runs_to_modify[-1]
-            
-            first_run = first_run_info[0]
-            last_run = last_run_info[0]
-            
-            # 最初のRunに残すべきプレフィックス（キーより前の部分）
-            rel_start = max(0, start_idx - first_run_info[1])
-            prefix = first_run.text[:rel_start]
-            
-            # 最後のRunに残すべきサフィックス（キーより後の部分）
-            rel_end = min(len(last_run.text), end_idx - last_run_info[1])
-            suffix = last_run.text[rel_end:]
-            
-            if len(runs_to_modify) == 1:
-                # ひとつのRun内で完結する場合（本来step1で終わるはずだが念のため）
-                first_run.text = prefix + str(value) + suffix
-            else:
-                # 複数のRunにまたがる場合
-                first_run.text = prefix + str(value) # 書式は最初のRunのものを継承
-                last_run.text = suffix
-                
-                # 間のRunは削除（テキストを空に）
-                for mid_run_info in runs_to_modify[1:-1]:
-                    mid_run_info[0].text = ""
-                
-                # もし最初と最後が別で、最後のRunのテキストが空になったら、それも消していいかも
-                if first_run != last_run and not suffix:
-                    last_run.text = ""
+            # 最初のRunに新しいテキストを設定
+            # (※これにより、段落全体の書式は「最初のRun」のものになる)
+            runs[0].text = new_text
 
 def fill_row_data(row, data_dict):
     for cell in row.cells:
         for paragraph in cell.paragraphs:
-            replace_text_in_paragraph_robust(paragraph, data_dict)
+            replace_text_in_paragraph_merged(paragraph, data_dict)
 
 def delete_row(table, row):
     tbl = table._tbl
@@ -227,42 +199,38 @@ def delete_row(table, row):
     tbl.remove(tr)
 
 def replace_text_in_document_body(doc, replacements):
-    # 本文
     for paragraph in doc.paragraphs:
-        replace_text_in_paragraph_robust(paragraph, replacements)
-    # ヘッダー・フッター
+        replace_text_in_paragraph_merged(paragraph, replacements)
     for section in doc.sections:
         for paragraph in section.header.paragraphs:
-            replace_text_in_paragraph_robust(paragraph, replacements)
+            replace_text_in_paragraph_merged(paragraph, replacements)
         for paragraph in section.footer.paragraphs:
-            replace_text_in_paragraph_robust(paragraph, replacements)
+            replace_text_in_paragraph_merged(paragraph, replacements)
 
 # ---------------------------------------------------------
 # 2. ドキュメント生成メインロジック
 # ---------------------------------------------------------
 
 def generate_word_from_template(template_path_or_file, groups, all_data, global_context):
+    """
+    採点表・受付表用（1つの表の中で完結するタイプ）
+    """
     doc = Document(template_path_or_file)
     
-    # 全体情報の置換
     global_replacements = {}
     for k, v in global_context.items():
         global_replacements[f"{{{{ {k} }}}}"] = v
     replace_text_in_document_body(doc, global_replacements)
 
-    # --- 表処理（採点表・WEBプログラム・受付表 共通） ---
-    # {{ time }} が含まれる表を探す
+    # 表処理
     target_table = None
     time_row_template = None
     data_row_template = None
     
     for table in doc.tables:
-        # この表の中に {{ time }} と {{ s.no }} (または {{ s.name }}) があるか探す
         t_row = None
         d_row = None
-        
         for row in table.rows:
-            # テキスト結合して検索（セルまたぎは考慮しないが、セル内ならOK）
             row_text = "".join([c.text for c in row.cells])
             if "{{ time }}" in row_text:
                 t_row = row
@@ -276,50 +244,26 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
             break
     
     if target_table:
-        # ひな形行をコピーして保持
-        time_row_copy = copy.deepcopy(time_row_template) # オブジェクトとして退避できないため、ロジック変更
-        # python-docxの行コピーは深いコピーが必要だが、XML要素を複製しないとテーブルから消すと消える
-        # よって、テーブルから行を削除する前に、そのXML要素をディープコピーして保持する戦略をとる
-        
-        # 行の特定（インデックスだとずれる可能性があるのでオブジェクトで管理したいが、削除するためインデックス操作が無難）
-        # しかし、削除するとインデックスが変わる。
-        # シンプルに: 
-        # 1. テンプレート行の内容を覚えておく -> 難しい（書式が複雑）
-        # 2. 行をコピーして最後に1つ追加しておく -> これをマスタにする
-        # 3. 元の行を消す
-        
-        # 採用案: 見つけた行そのものをテンプレートとして扱い、ループ処理後に削除する？
-        # いや、表の途中にある行をテンプレートにして、間に挿入していくのは難しい。
-        # なので、「テンプレート行を複製して最後に追加」->「移動」は大変。
-        
-        # ベストプラクティス:
-        # テンプレート行は「削除」せず、「不可視」にするか、あるいは「最初のグループ用」として使い回す。
-        # 今回は「一旦テーブルから行を削除し、そのXMLをメモリに持っておく」方式を採用。
-        
         tbl = target_table._tbl
         time_tr = time_row_template._tr
         data_tr = data_row_template._tr
         
-        # XMLツリーから外す（削除）が、Pythonオブジェクトとしては生きている
         tbl.remove(time_tr)
         tbl.remove(data_tr)
         
-        # これで time_row_template, data_row_template は「表に属さない行オブジェクト」になる
-        
         for group in groups:
-            # 1. 時間行の追加
+            # 1. 時間行
             new_tr_time = copy.deepcopy(time_tr)
-            tbl.append(new_tr_time) # 末尾に追加
+            tbl.append(new_tr_time)
             new_time_row = target_table.rows[-1]
             
             raw_time = group['time_str']
             formatted_time = format_time_label(raw_time)
             fill_row_data(new_time_row, {'{{ time }}': formatted_time})
 
-            # 2. メンバー解決
+            # 2. メンバー行
             target_members = resolve_participants_from_string(group['member_input'], all_data)
             
-            # 3. データ行の追加
             for member in target_members:
                 new_tr_data = copy.deepcopy(data_tr)
                 tbl.append(new_tr_data)
@@ -340,24 +284,128 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
     return output_buffer
 
 
-def generate_judges_list_doc(template_path_or_file, judges_list, global_context):
+def generate_web_program_doc(template_path_or_file, groups, all_data, global_context):
     """
-    審査員一覧を作成する関数
-    表の中 または 段落にある {{ judge_name }} を探して複製する
+    WEBプログラム用（段落(時間)＋表(データ) のセットを繰り返すタイプ）
     """
     doc = Document(template_path_or_file)
+    
+    global_replacements = {}
+    for k, v in global_context.items():
+        global_replacements[f"{{{{ {k} }}}}"] = v
+    replace_text_in_document_body(doc, global_replacements)
+    
+    # 1. テンプレートとなる「時間段落」と「データ表」を探す
+    template_time_para = None
+    template_data_table = None
+    
+    # 段落を走査
+    para_index = -1
+    for i, p in enumerate(doc.paragraphs):
+        if "{{ time }}" in p.text:
+            template_time_para = p
+            para_index = i
+            break
+            
+    # その段落より後にある最初の表を探す
+    if template_time_para:
+        # python-docxでは段落と表が混在する順序を正確に追うのが難しい場合があるが、
+        # document.element.body の子要素を順に見ていくのが確実。
+        
+        body_elements = doc._body._element.getchildren() # 全要素（段落、表など）
+        
+        found_time = False
+        target_p_xml = template_time_para._p
+        target_tbl_xml = None
+        
+        # XML要素レベルで検索
+        for elem in body_elements:
+            if elem == target_p_xml:
+                found_time = True
+                continue
+            
+            if found_time and elem.tag.endswith('tbl'):
+                # 時間段落の後に最初に見つかった表
+                # 中身にタグがあるか確認（念のため）
+                if "{{ s.name }}" in elem.xml or "{{ s.no }}" in elem.xml: # 簡易チェック
+                    target_tbl_xml = elem
+                    break
+        
+        if target_tbl_xml:
+            # テンプレート要素を確保（ディープコピー）
+            template_p_copy = copy.deepcopy(target_p_xml)
+            template_tbl_copy = copy.deepcopy(target_tbl_xml)
+            
+            # 元の要素をドキュメントから削除（XML操作）
+            doc._body._element.remove(target_p_xml)
+            doc._body._element.remove(target_tbl_xml)
+            
+            # ループ生成
+            for group in groups:
+                # 1. 時間段落の追加
+                new_p_xml = copy.deepcopy(template_p_copy)
+                doc._body._element.append(new_p_xml)
+                new_para = Paragraph(new_p_xml, doc._body)
+                
+                raw_time = group['time_str']
+                formatted_time = format_time_label(raw_time)
+                replace_text_in_paragraph_merged(new_para, {'{{ time }}': formatted_time})
+                
+                # 2. データ表の追加（メンバー分行を増やす処理含む）
+                # まず表の枠を追加
+                new_tbl_xml = copy.deepcopy(template_tbl_copy)
+                doc._body._element.append(new_tbl_xml)
+                
+                # 追加された表オブジェクトを取得（再構築）
+                # doc.tables はキャッシュされている可能性があるが、末尾に追加したので最後の表を取得
+                new_table = doc.tables[-1] 
+                
+                # この表の中のデータ行テンプレートを探す
+                data_row_template = None
+                for row in new_table.rows:
+                    row_text = "".join([c.text for c in row.cells])
+                    if "{{ s.no }}" in row_text or "{{ s.name }}" in row_text:
+                        data_row_template = row
+                        break
+                
+                if data_row_template:
+                    tbl_inner = new_table._tbl
+                    tr_template = data_row_template._tr
+                    tbl_inner.remove(tr_template) # テンプレート行を削除
+                    
+                    target_members = resolve_participants_from_string(group['member_input'], all_data)
+                    
+                    for member in target_members:
+                        new_tr = copy.deepcopy(tr_template)
+                        tbl_inner.append(new_tr)
+                        new_row = new_table.rows[-1]
+                        
+                        replacements = {
+                            '{{ s.no }}': member['no'],
+                            '{{ s.name }}': member['name'],
+                            '{{ s.kana }}': member.get('kana', ''),
+                            '{{ s.age }}': member.get('age', ''),
+                            '{{ s.tel }}': member.get('tel', ''),
+                            '{{ s.song }}': member['song'],
+                        }
+                        fill_row_data(new_row, replacements)
 
-    # 全体情報の置換
+    output_buffer = io.BytesIO()
+    doc.save(output_buffer)
+    return output_buffer
+
+
+def generate_judges_list_doc(template_path_or_file, judges_list, global_context):
+    doc = Document(template_path_or_file)
     global_replacements = {}
     for k, v in global_context.items():
         global_replacements[f"{{{{ {k} }}}}"] = v
     replace_text_in_document_body(doc, global_replacements)
 
-    # パターン1: 表の中にある場合
+    # パターン1: 表
     for table in doc.tables:
         target_row_idx = -1
         for i, row in enumerate(table.rows):
-            # 行内全テキスト結合で判定
             row_text = "".join([c.text for c in row.cells])
             if "{{ judge_name }}" in row_text:
                 target_row_idx = i
@@ -367,23 +415,17 @@ def generate_judges_list_doc(template_path_or_file, judges_list, global_context)
             template_row = table.rows[target_row_idx]
             tbl = table._tbl
             tr_xml = template_row._tr
-            
-            # テンプレート行を削除してメモリ保持
             tbl.remove(tr_xml)
-            
-            # 人数分ループ
             for judge in judges_list:
                 new_tr = copy.deepcopy(tr_xml)
                 tbl.append(new_tr)
                 new_row = table.rows[-1]
                 fill_row_data(new_row, {'{{ judge_name }}': judge})
-            
-            # 表で見つかったら他の表や段落は探さない（重複防止）
             output_buffer = io.BytesIO()
             doc.save(output_buffer)
             return output_buffer
 
-    # パターン2: 通常の段落にある場合
+    # パターン2: 段落
     target_para = None
     for para in doc.paragraphs:
         if "{{ judge_name }}" in para.text:
@@ -391,39 +433,22 @@ def generate_judges_list_doc(template_path_or_file, judges_list, global_context)
             break
             
     if target_para:
-        # テンプレート段落を保持し、削除
         p_element = target_para._p
         parent = target_para._parent
-        
-        # 削除前にディープコピーを取る
         template_p_xml = copy.deepcopy(p_element)
         
-        # 元の段落を削除 (xml操作)
-        # parentは通常 body だが、テキストボックス内などの可能性も考慮
         if hasattr(parent, '_element'):
-             # _elementからremoveする
-             try:
-                 parent._element.remove(p_element)
-             except:
-                 pass
+             try: parent._element.remove(p_element)
+             except: pass
         else:
-             # doc.paragraphsからの削除は直接APIがないのでxml操作
-             # body要素直下と仮定
-             try:
-                 doc._body._body.remove(p_element)
-             except:
-                 pass
+             try: doc._body._body.remove(p_element)
+             except: pass
         
-        # 人数分追加
         for judge in judges_list:
-            # XMLを複製
             new_p_xml = copy.deepcopy(template_p_xml)
-            # 末尾に追加（append）
             doc._body._body.append(new_p_xml)
-            
-            # Paragraphオブジェクト化して置換
             new_para = Paragraph(new_p_xml, parent)
-            replace_text_in_paragraph_robust(new_para, {'{{ judge_name }}': judge})
+            replace_text_in_paragraph_merged(new_para, {'{{ judge_name }}': judge})
 
     output_buffer = io.BytesIO()
     doc.save(output_buffer)
@@ -482,7 +507,6 @@ def main():
             
             col_song = c4.selectbox("演奏曲目", cols, index=cols.index("演奏曲目") if "演奏曲目" in cols else 0)
             
-            # 追加オプション列
             c5, c6, c7 = st.columns(3)
             default_age = cols.index("年齢") if "年齢" in cols else -1
             col_age = c5.selectbox("年齢列 (任意)", ["(なし)"] + cols, index=default_age + 1)
@@ -495,7 +519,6 @@ def main():
 
             st.markdown("---")
 
-            # データ変換
             for _, row in df.iterrows():
                 kana_val = str(row[col_kana]) if col_kana != "(なし)" else ""
                 age_val = str(row[col_age]) if col_age != "(なし)" else ""
@@ -534,7 +557,6 @@ def main():
             use_manual_upload = False
 
             if template_files:
-                # デフォルト値の自動検出
                 idx_score = 0
                 idx_reception = 0
                 idx_web = 0
@@ -578,14 +600,10 @@ def main():
                 uploaded_web_template = c_up3.file_uploader("WEBプログラムテンプレート (.docx)", type=['docx'])
                 uploaded_judges_template = c_up4.file_uploader("審査員リストテンプレート (.docx)", type=['docx'])
                 
-                if uploaded_score_template:
-                    score_template_path = uploaded_score_template
-                if uploaded_reception_template:
-                    reception_template_path = uploaded_reception_template
-                if uploaded_web_template:
-                    web_template_path = uploaded_web_template
-                if uploaded_judges_template:
-                    judges_list_template_path = uploaded_judges_template
+                if uploaded_score_template: score_template_path = uploaded_score_template
+                if uploaded_reception_template: reception_template_path = uploaded_reception_template
+                if uploaded_web_template: web_template_path = uploaded_web_template
+                if uploaded_judges_template: judges_list_template_path = uploaded_judges_template
 
             # --- 3. グループ・スケジュール設定 ---
             st.header("3. グループ・スケジュール設定")
@@ -723,7 +741,6 @@ def main():
                 "その他"
             ], index=["公式サイト上で掲載", "会場ロビーもしくはホワイエで掲載", "表彰式にて発表", "その他"].index(det['method']) if det['method'] in ["公式サイト上で掲載", "会場ロビーもしくはホワイエで掲載", "表彰式にて発表", "その他"] else 0)
 
-
             # --- 6. ファイル出力 ---
             st.header("6. ファイル出力")
             if st.button("ファイル生成を実行", type="primary"):
@@ -767,12 +784,9 @@ def main():
                     # 1. 採点表生成
                     for judge in valid_judges:
                         try:
-                            if hasattr(score_template_path, 'seek'):
-                                score_template_path.seek(0)
-                            
+                            if hasattr(score_template_path, 'seek'): score_template_path.seek(0)
                             context = base_context.copy()
                             context['judge_name'] = judge
-                            
                             doc_io = generate_word_from_template(score_template_path, st.session_state['groups'], all_data, context)
                             zf.writestr(f"採点表_{judge}.docx", doc_io.getvalue())
                         except Exception as e:
@@ -781,9 +795,7 @@ def main():
                     # 2. 受付表生成
                     if reception_template_path:
                         try:
-                            if hasattr(reception_template_path, 'seek'):
-                                reception_template_path.seek(0)
-                            
+                            if hasattr(reception_template_path, 'seek'): reception_template_path.seek(0)
                             context = base_context.copy()
                             context['judge_name'] = '受付用'
                             doc_io = generate_word_from_template(reception_template_path, st.session_state['groups'], all_data, context)
@@ -791,15 +803,14 @@ def main():
                         except Exception as e:
                             st.error(f"受付表生成エラー: {e}")
 
-                    # 3. WEBプログラム生成
+                    # 3. WEBプログラム生成（専用ロジック）
                     if web_template_path:
                         try:
-                            if hasattr(web_template_path, 'seek'):
-                                web_template_path.seek(0)
-                            
+                            if hasattr(web_template_path, 'seek'): web_template_path.seek(0)
                             context = base_context.copy()
                             context['judge_name'] = ''
-                            doc_io = generate_word_from_template(web_template_path, st.session_state['groups'], all_data, context)
+                            # ★ここで新設した関数を呼ぶ
+                            doc_io = generate_web_program_doc(web_template_path, st.session_state['groups'], all_data, context)
                             zf.writestr("WEBプログラム.docx", doc_io.getvalue())
                         except Exception as e:
                             st.error(f"WEBプログラム生成エラー: {e}")
@@ -807,9 +818,7 @@ def main():
                     # 4. 審査員リスト生成
                     if judges_list_template_path:
                          try:
-                            if hasattr(judges_list_template_path, 'seek'):
-                                judges_list_template_path.seek(0)
-                            
+                            if hasattr(judges_list_template_path, 'seek'): judges_list_template_path.seek(0)
                             context = base_context.copy()
                             doc_io = generate_judges_list_doc(judges_list_template_path, valid_judges, context)
                             zf.writestr("本日の審査員.docx", doc_io.getvalue())
