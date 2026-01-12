@@ -11,6 +11,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
+from email.header import Header
 from datetime import datetime, timedelta
 from docx import Document
 from docx.text.paragraph import Paragraph
@@ -198,7 +199,7 @@ def replace_text_in_document_full(doc, replacements):
                                 replace_text_smart(paragraph, replacements)
 
 # ---------------------------------------------------------
-# 2. メール送信機能（SSL対応版）
+# 2. メール送信機能（SSL対応版・添付ファイル名修正）
 # ---------------------------------------------------------
 
 def send_email_callback():
@@ -222,21 +223,49 @@ def send_email_callback():
         except:
             return
 
-    subject = f"【バックアップ】コンクール資料生成: {st.session_state.get('contest_name', '無題')}"
-    body = "コンクール運営資料の生成バックアップです。\n添付ファイルをご確認ください。"
+    contest_name = st.session_state.get('contest_name', '無題')
+    
+    # ZIP内のファイルリストを取得して本文を作成
+    file_list_str = ""
+    try:
+        # 現在のバッファ位置を保存し、先頭に戻して読み込む
+        current_pos = st.session_state['zip_buffer'].tell()
+        st.session_state['zip_buffer'].seek(0)
+        
+        with zipfile.ZipFile(st.session_state['zip_buffer'], 'r') as zf_read:
+            for name in zf_read.namelist():
+                file_list_str += f"・{name}\n"
+        
+        # バッファ位置を戻す
+        st.session_state['zip_buffer'].seek(current_pos)
+    except Exception as e:
+        file_list_str = f"（ファイル一覧取得エラー: {e}）"
+
+    # 生成日時
+    timestamp = datetime.now().strftime("%Y年%m月%d日%H時%M分")
+
+    # 件名と本文の構築
+    subject = f"採点表などを作成しました：{contest_name}"
+    body = f"""以下のファイルを生成しました。
+{file_list_str}
+生成日時：{timestamp}"""
     
     msg = MIMEMultipart()
     msg['From'] = sender_email
     msg['To'] = sender_email  # 自分自身に送信
-    msg['Subject'] = subject
+    msg['Subject'] = Header(subject, 'utf-8') # 件名の文字化け防止
     msg.attach(MIMEText(body, 'plain'))
 
     # ZIP添付
     part = MIMEBase('application', 'octet-stream')
     part.set_payload(st.session_state['zip_buffer'].getvalue())
     encoders.encode_base64(part)
-    filename = f"{st.session_state.get('contest_name', 'data')}.zip"
-    part.add_header('Content-Disposition', f'attachment; filename= {filename}')
+    
+    # ファイル名のエンコード処理 (noname回避)
+    filename = f"{contest_name}.zip"
+    encoded_filename = Header(filename, 'utf-8').encode()
+    part.add_header('Content-Disposition', 'attachment', filename=encoded_filename)
+    
     msg.attach(part)
 
     try:
