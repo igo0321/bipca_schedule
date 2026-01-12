@@ -6,12 +6,12 @@ import json
 import smtplib
 import re
 import os
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
-from datetime import datetime, timedelta
 import copy
+from datetime import datetime, timedelta
 from docx import Document
+from docx.text.paragraph import Paragraph
+# XML操作用
+from docx.oxml import OxmlElement
 
 # ---------------------------------------------------------
 # 1. ユーティリティ（時間変換・Word操作・データ解析）
@@ -118,55 +118,124 @@ def resolve_participants_from_string(input_str, all_data_list):
 # --- Word操作系 ---
 
 def copy_table_row(table, row):
+    """表の行を複製"""
     tbl = table._tbl
     new_tr = copy.deepcopy(row._tr)
     tbl.append(new_tr)
     return table.rows[-1]
 
-def replace_text_in_paragraph(paragraph, replacements):
+def duplicate_paragraph(paragraph, insert_after=True):
+    """段落をスタイルごと複製して挿入"""
+    p_element = paragraph._p
+    new_p_element = copy.deepcopy(p_element)
+    if insert_after:
+        p_element.addnext(new_p_element)
+    else:
+        p_element.addprevious(new_p_element)
+    return Paragraph(new_p_element, paragraph._parent)
+
+def replace_text_in_paragraph_robust(paragraph, replacements):
     """
-    段落内のテキストを置換する。
-    ★修正: 書式(Run)を維持するため、Run単位で検索・置換を行う。
+    【修正版】書式(Run)を維持したまま、タグが分割されていても正しく置換するロジック
     """
+    full_text = paragraph.text
+    
+    # 置換対象がなければ何もしない（高速化）
+    any_key = False
+    for k in replacements:
+        if k in full_text:
+            any_key = True
+            break
+    if not any_key:
+        return
+
+    # 1. まず単純なRun内置換を試みる（タグが分割されていない場合用）
     for key, value in replacements.items():
-        if key in paragraph.text:
-            # Run単位でループして置換を試みる（書式維持のため）
-            replaced_in_run = False
-            for run in paragraph.runs:
-                if key in run.text:
-                    run.text = run.text.replace(key, str(value))
-                    replaced_in_run = True
+        for run in paragraph.runs:
+            if key in run.text:
+                run.text = run.text.replace(key, str(value))
+    
+    # 2. タグが分割されている場合の処理（Runをまたぐ置換）
+    full_text = paragraph.text # 更新されたテキストを再取得
+    for key, value in replacements.items():
+        if key in full_text:
+            # キーの開始位置と終了位置を探す
+            start_idx = full_text.find(key)
+            if start_idx == -1: continue # すでに置換済み
             
-            # もしRun単位で置換できなかった場合（タグが複数のRunにまたがっている場合など）
-            # やむを得ず段落全体を書き換えるが、これだと書式が飛ぶ可能性がある。
-            # 基本的にはユーザー側でタグを一気に入力してもらうことで回避する。
-            if not replaced_in_run:
-                # 念のためのフォールバック（以前のロジックに近い）
-                full_text = paragraph.text
-                new_text = full_text.replace(key, str(value))
-                if paragraph.runs:
-                    paragraph.runs[0].text = new_text
-                    for sub_r in paragraph.runs[1:]:
-                        sub_r.text = ""
+            end_idx = start_idx + len(key)
+            
+            # 各Runがどの文字インデックス範囲を担当しているか調べる
+            current_idx = 0
+            runs_to_modify = []
+            
+            for run in paragraph.runs:
+                run_len = len(run.text)
+                run_start = current_idx
+                run_end = current_idx + run_len
+                
+                # キーと重なっているRunを特定
+                if run_end > start_idx and run_start < end_idx:
+                    runs_to_modify.append((run, run_start, run_end))
+                
+                current_idx += run_len
+            
+            if not runs_to_modify: continue
+
+            # 置換戦略:
+            # 最初のRunに「前の残り + 値」を入れ、最後のRunに「後ろの残り」を入れる。
+            # 間のRunは空にする。
+            
+            first_run_info = runs_to_modify[0]
+            last_run_info = runs_to_modify[-1]
+            
+            first_run = first_run_info[0]
+            last_run = last_run_info[0]
+            
+            # 最初のRunに残すべきプレフィックス（キーより前の部分）
+            rel_start = max(0, start_idx - first_run_info[1])
+            prefix = first_run.text[:rel_start]
+            
+            # 最後のRunに残すべきサフィックス（キーより後の部分）
+            rel_end = min(len(last_run.text), end_idx - last_run_info[1])
+            suffix = last_run.text[rel_end:]
+            
+            if len(runs_to_modify) == 1:
+                # ひとつのRun内で完結する場合（本来step1で終わるはずだが念のため）
+                first_run.text = prefix + str(value) + suffix
+            else:
+                # 複数のRunにまたがる場合
+                first_run.text = prefix + str(value) # 書式は最初のRunのものを継承
+                last_run.text = suffix
+                
+                # 間のRunは削除（テキストを空に）
+                for mid_run_info in runs_to_modify[1:-1]:
+                    mid_run_info[0].text = ""
+                
+                # もし最初と最後が別で、最後のRunのテキストが空になったら、それも消していいかも
+                if first_run != last_run and not suffix:
+                    last_run.text = ""
 
 def fill_row_data(row, data_dict):
     for cell in row.cells:
         for paragraph in cell.paragraphs:
-            replace_text_in_paragraph(paragraph, data_dict)
+            replace_text_in_paragraph_robust(paragraph, data_dict)
 
-def delete_row(table, row_idx):
+def delete_row(table, row):
     tbl = table._tbl
-    tr = table.rows[row_idx]._tr
+    tr = row._tr
     tbl.remove(tr)
 
 def replace_text_in_document_body(doc, replacements):
+    # 本文
     for paragraph in doc.paragraphs:
-        replace_text_in_paragraph(paragraph, replacements)
+        replace_text_in_paragraph_robust(paragraph, replacements)
+    # ヘッダー・フッター
     for section in doc.sections:
         for paragraph in section.header.paragraphs:
-            replace_text_in_paragraph(paragraph, replacements)
+            replace_text_in_paragraph_robust(paragraph, replacements)
         for paragraph in section.footer.paragraphs:
-            replace_text_in_paragraph(paragraph, replacements)
+            replace_text_in_paragraph_robust(paragraph, replacements)
 
 # ---------------------------------------------------------
 # 2. ドキュメント生成メインロジック
@@ -181,27 +250,68 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
         global_replacements[f"{{{{ {k} }}}}"] = v
     replace_text_in_document_body(doc, global_replacements)
 
-    # 表処理（採点表・WEBプログラム共通）
-    if not doc.tables:
-        output_buffer = io.BytesIO()
-        doc.save(output_buffer)
-        return output_buffer
+    # --- 表処理（採点表・WEBプログラム・受付表 共通） ---
+    # {{ time }} が含まれる表を探す
+    target_table = None
+    time_row_template = None
+    data_row_template = None
     
-    table = doc.tables[0]
-    
-    # テンプレート構造チェック: 最低3行必要（ヘッダー、時間行、データ行）
-    # WEBプログラムもこの形式に合わせてください
-    if len(table.rows) >= 3:
-        time_row_template = table.rows[1]
-        data_row_template = table.rows[2]
+    for table in doc.tables:
+        # この表の中に {{ time }} と {{ s.no }} (または {{ s.name }}) があるか探す
+        t_row = None
+        d_row = None
         
-        # ひな形行を削除
-        delete_row(table, 2)
-        delete_row(table, 1)
+        for row in table.rows:
+            # テキスト結合して検索（セルまたぎは考慮しないが、セル内ならOK）
+            row_text = "".join([c.text for c in row.cells])
+            if "{{ time }}" in row_text:
+                t_row = row
+            if "{{ s.no }}" in row_text or "{{ s.name }}" in row_text:
+                d_row = row
+        
+        if t_row and d_row:
+            target_table = table
+            time_row_template = t_row
+            data_row_template = d_row
+            break
+    
+    if target_table:
+        # ひな形行をコピーして保持
+        time_row_copy = copy.deepcopy(time_row_template) # オブジェクトとして退避できないため、ロジック変更
+        # python-docxの行コピーは深いコピーが必要だが、XML要素を複製しないとテーブルから消すと消える
+        # よって、テーブルから行を削除する前に、そのXML要素をディープコピーして保持する戦略をとる
+        
+        # 行の特定（インデックスだとずれる可能性があるのでオブジェクトで管理したいが、削除するためインデックス操作が無難）
+        # しかし、削除するとインデックスが変わる。
+        # シンプルに: 
+        # 1. テンプレート行の内容を覚えておく -> 難しい（書式が複雑）
+        # 2. 行をコピーして最後に1つ追加しておく -> これをマスタにする
+        # 3. 元の行を消す
+        
+        # 採用案: 見つけた行そのものをテンプレートとして扱い、ループ処理後に削除する？
+        # いや、表の途中にある行をテンプレートにして、間に挿入していくのは難しい。
+        # なので、「テンプレート行を複製して最後に追加」->「移動」は大変。
+        
+        # ベストプラクティス:
+        # テンプレート行は「削除」せず、「不可視」にするか、あるいは「最初のグループ用」として使い回す。
+        # 今回は「一旦テーブルから行を削除し、そのXMLをメモリに持っておく」方式を採用。
+        
+        tbl = target_table._tbl
+        time_tr = time_row_template._tr
+        data_tr = data_row_template._tr
+        
+        # XMLツリーから外す（削除）が、Pythonオブジェクトとしては生きている
+        tbl.remove(time_tr)
+        tbl.remove(data_tr)
+        
+        # これで time_row_template, data_row_template は「表に属さない行オブジェクト」になる
         
         for group in groups:
-            # 1. 時間行
-            new_time_row = copy_table_row(table, time_row_template)
+            # 1. 時間行の追加
+            new_tr_time = copy.deepcopy(time_tr)
+            tbl.append(new_tr_time) # 末尾に追加
+            new_time_row = target_table.rows[-1]
+            
             raw_time = group['time_str']
             formatted_time = format_time_label(raw_time)
             fill_row_data(new_time_row, {'{{ time }}': formatted_time})
@@ -209,9 +319,12 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
             # 2. メンバー解決
             target_members = resolve_participants_from_string(group['member_input'], all_data)
             
-            # 3. データ行
+            # 3. データ行の追加
             for member in target_members:
-                new_data_row = copy_table_row(table, data_row_template)
+                new_tr_data = copy.deepcopy(data_tr)
+                tbl.append(new_tr_data)
+                new_data_row = target_table.rows[-1]
+                
                 replacements = {
                     '{{ s.no }}': member['no'],
                     '{{ s.name }}': member['name'],
@@ -230,7 +343,7 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
 def generate_judges_list_doc(template_path_or_file, judges_list, global_context):
     """
     審査員一覧を作成する関数
-    表の中に {{ judge_name }} がある行を探し、人数分複製する
+    表の中 または 段落にある {{ judge_name }} を探して複製する
     """
     doc = Document(template_path_or_file)
 
@@ -240,29 +353,77 @@ def generate_judges_list_doc(template_path_or_file, judges_list, global_context)
         global_replacements[f"{{{{ {k} }}}}"] = v
     replace_text_in_document_body(doc, global_replacements)
 
-    if doc.tables:
-        table = doc.tables[0]
+    # パターン1: 表の中にある場合
+    for table in doc.tables:
         target_row_idx = -1
-        
-        # {{ judge_name }} を含む行を探す
         for i, row in enumerate(table.rows):
-            for cell in row.cells:
-                if "{{ judge_name }}" in cell.text:
-                    target_row_idx = i
-                    break
-            if target_row_idx != -1:
+            # 行内全テキスト結合で判定
+            row_text = "".join([c.text for c in row.cells])
+            if "{{ judge_name }}" in row_text:
+                target_row_idx = i
                 break
         
         if target_row_idx != -1:
             template_row = table.rows[target_row_idx]
+            tbl = table._tbl
+            tr_xml = template_row._tr
             
-            # 審査員数分ループ
+            # テンプレート行を削除してメモリ保持
+            tbl.remove(tr_xml)
+            
+            # 人数分ループ
             for judge in judges_list:
-                new_row = copy_table_row(table, template_row)
+                new_tr = copy.deepcopy(tr_xml)
+                tbl.append(new_tr)
+                new_row = table.rows[-1]
                 fill_row_data(new_row, {'{{ judge_name }}': judge})
             
-            # 元のひな形行を削除
-            delete_row(table, target_row_idx)
+            # 表で見つかったら他の表や段落は探さない（重複防止）
+            output_buffer = io.BytesIO()
+            doc.save(output_buffer)
+            return output_buffer
+
+    # パターン2: 通常の段落にある場合
+    target_para = None
+    for para in doc.paragraphs:
+        if "{{ judge_name }}" in para.text:
+            target_para = para
+            break
+            
+    if target_para:
+        # テンプレート段落を保持し、削除
+        p_element = target_para._p
+        parent = target_para._parent
+        
+        # 削除前にディープコピーを取る
+        template_p_xml = copy.deepcopy(p_element)
+        
+        # 元の段落を削除 (xml操作)
+        # parentは通常 body だが、テキストボックス内などの可能性も考慮
+        if hasattr(parent, '_element'):
+             # _elementからremoveする
+             try:
+                 parent._element.remove(p_element)
+             except:
+                 pass
+        else:
+             # doc.paragraphsからの削除は直接APIがないのでxml操作
+             # body要素直下と仮定
+             try:
+                 doc._body._body.remove(p_element)
+             except:
+                 pass
+        
+        # 人数分追加
+        for judge in judges_list:
+            # XMLを複製
+            new_p_xml = copy.deepcopy(template_p_xml)
+            # 末尾に追加（append）
+            doc._body._body.append(new_p_xml)
+            
+            # Paragraphオブジェクト化して置換
+            new_para = Paragraph(new_p_xml, parent)
+            replace_text_in_paragraph_robust(new_para, {'{{ judge_name }}': judge})
 
     output_buffer = io.BytesIO()
     doc.save(output_buffer)
@@ -368,7 +529,7 @@ def main():
             score_template_path = None
             reception_template_path = None
             web_template_path = None
-            judges_list_template_path = None # 審査員リスト用
+            judges_list_template_path = None
             
             use_manual_upload = False
 
@@ -382,7 +543,7 @@ def main():
                     if "採点表" in f: idx_score = i
                     if "受付表" in f: idx_reception = i
                     if "WEB" in f or "プログラム" in f: idx_web = i
-                    if "審査員" in f and "リスト" not in f: idx_judges = i # 「本日の審査員」など
+                    if "審査員" in f and "リスト" not in f: idx_judges = i
                 
                 col_t1, col_t2 = st.columns(2)
                 col_t3, col_t4 = st.columns(2)
@@ -643,7 +804,7 @@ def main():
                         except Exception as e:
                             st.error(f"WEBプログラム生成エラー: {e}")
                             
-                    # 4. 審査員リスト生成 (New)
+                    # 4. 審査員リスト生成
                     if judges_list_template_path:
                          try:
                             if hasattr(judges_list_template_path, 'seek'):
@@ -655,7 +816,7 @@ def main():
                          except Exception as e:
                             st.error(f"審査員リスト生成エラー: {e}")
 
-                    # 5. PDFファイルの同梱 (New)
+                    # 5. PDFファイルの同梱
                     if os.path.exists(TEMPLATE_DIR):
                         pdf_files = [f for f in os.listdir(TEMPLATE_DIR) if f.endswith(".pdf")]
                         for pdf_file in pdf_files:
