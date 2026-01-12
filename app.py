@@ -198,7 +198,7 @@ def replace_text_in_document_full(doc, replacements):
                                 replace_text_smart(paragraph, replacements)
 
 # ---------------------------------------------------------
-# 2. メール送信機能
+# 2. メール送信機能（SSL対応版）
 # ---------------------------------------------------------
 
 def send_email_callback():
@@ -208,13 +208,19 @@ def send_email_callback():
 
     # Streamlit Secrets から設定を取得
     try:
-        smtp_server = st.secrets["smtp"]["server"]
-        smtp_port = st.secrets["smtp"]["port"]
-        sender_email = st.secrets["smtp"]["sender_email"]
-        password = st.secrets["smtp"]["password"]
+        smtp_server = st.secrets["email"]["smtp_server"]
+        smtp_port = st.secrets["email"]["smtp_port"]
+        sender_email = st.secrets["email"]["sender_email"]
+        password = st.secrets["email"]["sender_password"]
     except Exception:
-        # シークレットが設定されていない場合は何もしない（ローカル環境など）
-        return
+        # シークレットキー名が異なる場合のフォールバック（smtp or email）
+        try:
+            smtp_server = st.secrets["smtp"]["server"]
+            smtp_port = st.secrets["smtp"]["port"]
+            sender_email = st.secrets["smtp"]["sender_email"]
+            password = st.secrets["smtp"]["password"]
+        except:
+            return
 
     subject = f"【バックアップ】コンクール資料生成: {st.session_state.get('contest_name', '無題')}"
     body = "コンクール運営資料の生成バックアップです。\n添付ファイルをご確認ください。"
@@ -234,12 +240,11 @@ def send_email_callback():
     msg.attach(part)
 
     try:
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()
+        # ロリポップ等はポート465でSMTP_SSLを使用する
+        server = smtplib.SMTP_SSL(smtp_server, smtp_port)
         server.login(sender_email, password)
         server.send_message(msg)
         server.quit()
-        # ダウンロードと同時に裏で実行されるため、Toast等は表示されない場合があるがログには残る
         print("Backup email sent successfully.")
     except Exception as e:
         print(f"Failed to send email: {e}")
@@ -323,10 +328,7 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
 
 def generate_web_program_doc(template_path_or_file, groups, all_data, global_context):
     """
-    WEBプログラム用（特殊ロジック適用）
-    1. 特定のタグ（contest_name等）は置換後に強制太字
-    2. 出場者行（No,Name,Kana,Age）は行を再構築して書式（太字/標準）を完全分離
-    3. 曲目行は強制標準
+    WEBプログラム用（セル単位スキャン＋書式強制ロジック）
     """
     doc = Document(template_path_or_file)
     
@@ -339,7 +341,7 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
     replace_text_in_document_full(doc, global_replacements)
     
     # 特定タグの太字化（置換後の値を検索して太字にする）
-    # ※値が重複する場合すべて太字になるが、WEBプログラムの仕様上問題なしと判断
+    # ※ contest_open等は対象外なので、ここでは太字にしない
     bold_target_values = [
         global_context.get('contest_name', ''),
         global_context.get('contest_date', ''),
@@ -432,69 +434,65 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
                 target_members = resolve_participants_from_string(group['member_input'], all_data)
                 
                 for member in target_members:
-                    for idx, tr_template in enumerate(data_tr_list):
+                    for tr_template in data_tr_list:
                         new_tr = copy.deepcopy(tr_template)
                         new_tbl_xml.append(new_tr)
                         
+                        # 直前に追加された行を取得するためにテーブルを再取得
+                        # (XML操作だけではセルの中身を編集できないため)
                         current_table = doc.tables[-1] 
                         current_row = current_table.rows[-1]
                         
-                        # 行ごとの処理（1行目は番号・氏名、2行目は曲目と仮定）
-                        if idx == 0:
-                            # --- 1行目: 強制再構築（書式分離） ---
-                            # セル内の段落を特定（結合セルの場合、最初のセルのみテキストがあるはず）
-                            target_cell = None
-                            for cell in current_row.cells:
-                                # 結合セル対応: 最初のセルに書き込む
-                                target_cell = cell
-                                break 
+                        # --- 重要: セル単位スキャン & 書き込み ---
+                        # 行内の全セルをチェックし、特定のタグがある場所にだけ
+                        # 指定された書式で書き込む（他のセルのレイアウトは壊さない）
+                        
+                        for cell in current_row.cells:
+                            # タグが含まれているかチェックするためにテキスト取得
+                            # ※セル結合されている場合、同じセルオブジェクトが複数回回ってくる可能性があるが、
+                            # 内容を書き換えるとタグが消えるため、2回目以降はヒットしないので安全。
+                            cell_text = cell.text
                             
-                            if target_cell:
-                                p = target_cell.paragraphs[0]
-                                p.clear() # 既存の内容を消去
+                            if "{{ s.no }}" in cell_text:
+                                cell.text = "" # クリア
+                                p = cell.paragraphs[0]
+                                run = p.add_run(f"{member['no']}")
+                                run.font.bold = True # 太字
                                 
-                                # 番号（太字）
-                                run_no = p.add_run(f"{member['no']}")
-                                run_no.font.bold = True
+                            if "{{ s.name }}" in cell_text:
+                                cell.text = "" # クリア
+                                p = cell.paragraphs[0]
                                 
-                                # カンマ（標準）
-                                run_sep1 = p.add_run(",")
-                                run_sep1.font.bold = False
-                                
-                                # 氏名（太字）
+                                # 氏名 (太字)
                                 run_name = p.add_run(f"{member['name']}")
                                 run_name.font.bold = True
                                 
-                                # スペースとカッコ（標準）
-                                run_sep2 = p.add_run(" （")
-                                run_sep2.font.bold = False
+                                # スペース・カッコ (標準)
+                                run_sep1 = p.add_run(" （")
+                                run_sep1.font.bold = False
                                 
-                                # フリガナ（標準）
+                                # フリガナ (標準)
                                 if member.get('kana'):
                                     run_kana = p.add_run(f"{member['kana']}")
                                     run_kana.font.bold = False
                                 
-                                # 区切り（標準）
-                                run_sep3 = p.add_run("・")
-                                run_sep3.font.bold = False
+                                # 中黒 (標準)
+                                run_sep2 = p.add_run("・")
+                                run_sep2.font.bold = False
                                 
-                                # 年齢（標準）
+                                # 年齢 (標準)
                                 run_age = p.add_run(f"{member.get('age', '')}")
                                 run_age.font.bold = False
                                 
-                                # 閉じカッコ（標準）
-                                run_sep4 = p.add_run("歳）")
-                                run_sep4.font.bold = False
-
-                        else:
-                            # --- 2行目以降（曲目など）: 強制標準化 ---
-                            replacements = {'{{ s.song }}': member['song']}
-                            fill_row_data(current_row, replacements)
-                            # 全Runを標準（太字OFF）にする
-                            for cell in current_row.cells:
-                                for p in cell.paragraphs:
-                                    for run in p.runs:
-                                        run.font.bold = False
+                                # 歳・閉じカッコ (標準)
+                                run_sep3 = p.add_run("歳）")
+                                run_sep3.font.bold = False
+                                
+                            if "{{ s.song }}" in cell_text:
+                                cell.text = "" # クリア
+                                p = cell.paragraphs[0]
+                                run_song = p.add_run(f"{member['song']}")
+                                run_song.font.bold = False # 標準
 
                 doc_body.append(copy.deepcopy(template_p_xml))
                 last_p = Paragraph(doc_body[-1], doc._body)
