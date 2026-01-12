@@ -6,9 +6,15 @@ import json
 import re
 import os
 import copy
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
 from datetime import datetime, timedelta
 from docx import Document
 from docx.text.paragraph import Paragraph
+from docx.shared import Pt
 
 # ---------------------------------------------------------
 # 1. ユーティリティ（時間変換・Word操作・データ解析）
@@ -109,47 +115,38 @@ def resolve_participants_from_string(input_str, all_data_list):
                 resolved_members.append(all_data_list[idx])
     return resolved_members
 
-# --- Word操作系（修正版：スマート置換） ---
+# --- Word操作系 ---
 
 def replace_text_smart(paragraph, replacements):
     """
     強力な置換関数。
     1. まずRunごとの単純置換を試みる（スタイル維持）。
     2. それで置換しきれない（タグが分割されている）場合、
-       段落内のテキストを強制的に結合して置換する（確実性優先）。
+       段落内のテキストを強制的に結合して置換する。
     """
     full_text = paragraph.text
-    # 置換対象のキーがそもそも含まれていなければ何もしない
     if not any(key in full_text for key in replacements):
         return
 
-    # 1. 単純置換トライ（スタイル維持のため）
+    # 1. 単純置換
     if paragraph.runs:
         for run in paragraph.runs:
             for key, val in replacements.items():
                 if key in run.text:
                     run.text = run.text.replace(key, str(val))
 
-    # 2. 残存チェックと強制置換（Fallback）
-    # 単純置換後もまだキーが残っている＝タグがRunを跨いで分割されている
+    # 2. 残存チェックと強制置換
     full_text_new = paragraph.text
     remaining_keys = [k for k in replacements if k in full_text_new]
 
     if remaining_keys:
-        # 強制結合モード
-        # 注意: 最初のRunのスタイルが全体に適用される可能性がありますが、
-        # タグがそのまま残るよりは良いという判断です。
-        
-        # 現在のテキストを取得して一括置換
         current_text = full_text_new
         for k in remaining_keys:
             current_text = current_text.replace(k, str(replacements[k]))
         
-        # 全Runをクリア
         for run in paragraph.runs:
             run.text = ""
         
-        # 最初のRunに置換後テキストを設定（なければ作る）
         if paragraph.runs:
             paragraph.runs[0].text = current_text
         else:
@@ -163,30 +160,100 @@ def fill_row_data(row, data_dict):
 
 def replace_text_in_document_full(doc, replacements):
     """
-    ドキュメント全体（本文段落＋全テーブル内のセル）を対象に置換を行う。
+    ドキュメント全体（本文、表、ヘッダー、フッター）を対象に置換を行う。
     """
     # 1. 本文段落
     for paragraph in doc.paragraphs:
         replace_text_smart(paragraph, replacements)
     
-    # 2. 表の中の段落（ここが重要：スケジュール表などはここにある）
+    # 2. 本文の表
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for paragraph in cell.paragraphs:
                     replace_text_smart(paragraph, replacements)
+                    
+    # 3. ヘッダー・フッター（全セクション）
+    for section in doc.sections:
+        # ヘッダー (通常, 1ページ目, 偶数ページ)
+        for header in [section.header, section.first_page_header, section.even_page_header]:
+            if header:
+                for paragraph in header.paragraphs:
+                    replace_text_smart(paragraph, replacements)
+                for table in header.tables:
+                    for row in table.rows:
+                        for cell in row.cells:
+                            for paragraph in cell.paragraphs:
+                                replace_text_smart(paragraph, replacements)
+        
+        # フッター
+        for footer in [section.footer, section.first_page_footer, section.even_page_footer]:
+            if footer:
+                for paragraph in footer.paragraphs:
+                    replace_text_smart(paragraph, replacements)
+                for table in footer.tables:
+                    for row in table.rows:
+                        for cell in row.cells:
+                            for paragraph in cell.paragraphs:
+                                replace_text_smart(paragraph, replacements)
 
 # ---------------------------------------------------------
-# 2. ドキュメント生成メインロジック
+# 2. メール送信機能
+# ---------------------------------------------------------
+
+def send_email_callback():
+    """ZIPファイルダウンロード時にメールを送信するコールバック関数"""
+    if 'zip_buffer' not in st.session_state or not st.session_state['zip_buffer']:
+        return
+
+    # Streamlit Secrets から設定を取得
+    try:
+        smtp_server = st.secrets["smtp"]["server"]
+        smtp_port = st.secrets["smtp"]["port"]
+        sender_email = st.secrets["smtp"]["sender_email"]
+        password = st.secrets["smtp"]["password"]
+    except Exception:
+        # シークレットが設定されていない場合は何もしない（ローカル環境など）
+        return
+
+    subject = f"【バックアップ】コンクール資料生成: {st.session_state.get('contest_name', '無題')}"
+    body = "コンクール運営資料の生成バックアップです。\n添付ファイルをご確認ください。"
+    
+    msg = MIMEMultipart()
+    msg['From'] = sender_email
+    msg['To'] = sender_email  # 自分自身に送信
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+
+    # ZIP添付
+    part = MIMEBase('application', 'octet-stream')
+    part.set_payload(st.session_state['zip_buffer'].getvalue())
+    encoders.encode_base64(part)
+    filename = f"{st.session_state.get('contest_name', 'data')}.zip"
+    part.add_header('Content-Disposition', f'attachment; filename= {filename}')
+    msg.attach(part)
+
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(sender_email, password)
+        server.send_message(msg)
+        server.quit()
+        # ダウンロードと同時に裏で実行されるため、Toast等は表示されない場合があるがログには残る
+        print("Backup email sent successfully.")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+# ---------------------------------------------------------
+# 3. ドキュメント生成ロジック
 # ---------------------------------------------------------
 
 def generate_word_from_template(template_path_or_file, groups, all_data, global_context):
     """
-    採点表・受付表用
+    採点表・受付表用 (従来のスマート置換を使用)
     """
     doc = Document(template_path_or_file)
     
-    # グローバル変数の置換
     global_replacements = {}
     for k, v in global_context.items():
         global_replacements[f"{{{{ {k} }}}}"] = v
@@ -218,7 +285,6 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
         time_tr = time_row_template._tr
         data_tr = data_row_template._tr
         
-        # テンプレート行を削除
         tbl.remove(time_tr)
         tbl.remove(data_tr)
         
@@ -257,16 +323,45 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
 
 def generate_web_program_doc(template_path_or_file, groups, all_data, global_context):
     """
-    WEBプログラム用（2行セット対応＋スマート置換）
+    WEBプログラム用（特殊ロジック適用）
+    1. 特定のタグ（contest_name等）は置換後に強制太字
+    2. 出場者行（No,Name,Kana,Age）は行を再構築して書式（太字/標準）を完全分離
+    3. 曲目行は強制標準
     """
     doc = Document(template_path_or_file)
     
     global_replacements = {}
     for k, v in global_context.items():
         global_replacements[f"{{{{ {k} }}}}"] = v
+    
+    # --- Step 1: グローバル変数の置換と太字強制 ---
+    # ヘッダー・フッター含む全置換
     replace_text_in_document_full(doc, global_replacements)
     
-    # テンプレートとなる「時間段落」と「データ表」を探す
+    # 特定タグの太字化（置換後の値を検索して太字にする）
+    # ※値が重複する場合すべて太字になるが、WEBプログラムの仕様上問題なしと判断
+    bold_target_values = [
+        global_context.get('contest_name', ''),
+        global_context.get('contest_date', ''),
+        global_context.get('contest_hall', '')
+    ]
+    
+    def apply_bold_to_targets(doc_obj, target_values):
+        def _process_para(para):
+            for run in para.runs:
+                for val in target_values:
+                    if val and val in run.text:
+                        run.font.bold = True
+
+        for p in doc_obj.paragraphs: _process_para(p)
+        for t in doc_obj.tables:
+            for r in t.rows:
+                for c in r.cells:
+                    for p in c.paragraphs: _process_para(p)
+    
+    apply_bold_to_targets(doc, bold_target_values)
+
+    # --- Step 2: テンプレート行の特定とループ処理 ---
     template_time_para = None
     template_data_table = None
     
@@ -286,31 +381,26 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
                 break
         
         if template_data_table:
-            # --- テンプレート要素の退避（コピー） ---
+            # 要素のコピー
             template_p_xml = copy.deepcopy(template_time_para._p)
             template_tbl_xml = copy.deepcopy(template_data_table._tbl)
             
-            # --- テンプレート要素の削除 ---
+            # 元の削除
             parent_body = template_time_para._element.getparent()
-            if parent_body is not None:
-                parent_body.remove(template_time_para._p)
+            if parent_body is not None: parent_body.remove(template_time_para._p)
             
             parent_tbl = template_data_table._tbl.getparent()
-            if parent_tbl is not None:
-                parent_tbl.remove(template_data_table._tbl)
+            if parent_tbl is not None: parent_tbl.remove(template_data_table._tbl)
             
-            # --- 出場者行テンプレートの抽出（2行セット対応） ---
+            # 行テンプレート抽出
             data_tr_list = []
             header_tr_list = []
-            
             temp_rows = list(template_tbl_xml.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr'))
-            
             start_index = -1
-            rows_per_entry = 2 # 2行1セット
+            rows_per_entry = 2 
 
             for i, tr in enumerate(temp_rows):
                 text_content = "".join([t.text for t in tr.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t')])
-                
                 if "{{ s.no }}" in text_content:
                     start_index = i
                     break
@@ -321,14 +411,12 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
                 end_index = min(start_index + rows_per_entry, len(temp_rows))
                 data_tr_list = temp_rows[start_index : end_index]
             
-            # テーブルの中身をクリア
-            for tr in temp_rows:
-                template_tbl_xml.remove(tr)
+            for tr in temp_rows: template_tbl_xml.remove(tr)
             
             doc_body = doc._body._element
             
             for group in groups:
-                # 1. 時間段落の追加
+                # 1. 時間
                 new_p_xml = copy.deepcopy(template_p_xml)
                 doc_body.append(new_p_xml)
                 new_para = Paragraph(new_p_xml, doc._body)
@@ -336,34 +424,77 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
                 formatted_time = format_time_label(raw_time)
                 replace_text_smart(new_para, {'{{ time }}': formatted_time})
                 
-                # 2. テーブルの追加
+                # 2. テーブル
                 new_tbl_xml = copy.deepcopy(template_tbl_xml)
                 doc_body.append(new_tbl_xml)
+                for h_tr in header_tr_list: new_tbl_xml.append(copy.deepcopy(h_tr))
                 
-                # ヘッダー行復元
-                for h_tr in header_tr_list:
-                    new_tbl_xml.append(copy.deepcopy(h_tr))
-                
-                # メンバー行追加
                 target_members = resolve_participants_from_string(group['member_input'], all_data)
                 
                 for member in target_members:
-                    for tr_template in data_tr_list:
+                    for idx, tr_template in enumerate(data_tr_list):
                         new_tr = copy.deepcopy(tr_template)
                         new_tbl_xml.append(new_tr)
                         
-                        # 置換実行
                         current_table = doc.tables[-1] 
                         current_row = current_table.rows[-1]
                         
-                        replacements = {
-                            '{{ s.no }}': member['no'],
-                            '{{ s.name }}': member['name'],
-                            '{{ s.kana }}': member.get('kana', ''),
-                            '{{ s.age }}': member.get('age', ''),
-                            '{{ s.song }}': member['song'],
-                        }
-                        fill_row_data(current_row, replacements)
+                        # 行ごとの処理（1行目は番号・氏名、2行目は曲目と仮定）
+                        if idx == 0:
+                            # --- 1行目: 強制再構築（書式分離） ---
+                            # セル内の段落を特定（結合セルの場合、最初のセルのみテキストがあるはず）
+                            target_cell = None
+                            for cell in current_row.cells:
+                                # 結合セル対応: 最初のセルに書き込む
+                                target_cell = cell
+                                break 
+                            
+                            if target_cell:
+                                p = target_cell.paragraphs[0]
+                                p.clear() # 既存の内容を消去
+                                
+                                # 番号（太字）
+                                run_no = p.add_run(f"{member['no']}")
+                                run_no.font.bold = True
+                                
+                                # カンマ（標準）
+                                run_sep1 = p.add_run(",")
+                                run_sep1.font.bold = False
+                                
+                                # 氏名（太字）
+                                run_name = p.add_run(f"{member['name']}")
+                                run_name.font.bold = True
+                                
+                                # スペースとカッコ（標準）
+                                run_sep2 = p.add_run(" （")
+                                run_sep2.font.bold = False
+                                
+                                # フリガナ（標準）
+                                if member.get('kana'):
+                                    run_kana = p.add_run(f"{member['kana']}")
+                                    run_kana.font.bold = False
+                                
+                                # 区切り（標準）
+                                run_sep3 = p.add_run("・")
+                                run_sep3.font.bold = False
+                                
+                                # 年齢（標準）
+                                run_age = p.add_run(f"{member.get('age', '')}")
+                                run_age.font.bold = False
+                                
+                                # 閉じカッコ（標準）
+                                run_sep4 = p.add_run("歳）")
+                                run_sep4.font.bold = False
+
+                        else:
+                            # --- 2行目以降（曲目など）: 強制標準化 ---
+                            replacements = {'{{ s.song }}': member['song']}
+                            fill_row_data(current_row, replacements)
+                            # 全Runを標準（太字OFF）にする
+                            for cell in current_row.cells:
+                                for p in cell.paragraphs:
+                                    for run in p.runs:
+                                        run.font.bold = False
 
                 doc_body.append(copy.deepcopy(template_p_xml))
                 last_p = Paragraph(doc_body[-1], doc._body)
@@ -670,6 +801,7 @@ def main():
                 st.session_state['judges'][i] = val
 
             contest_name = st.text_input("コンクール名 (ファイル名等に使用)", "第10回BIPCA 東京予選④")
+            st.session_state['contest_name'] = contest_name # セッションに保存(メール件名用)
 
             # --- 5. 審査会詳細 ---
             st.header("5. 審査会詳細")
@@ -802,13 +934,18 @@ def main():
                     # 設定ファイル
                     zf.writestr("設定データ.json", config_json)
                 
-                st.success("生成完了！")
-                
+                # ZIPバッファをセッションステートに保存
+                st.session_state['zip_buffer'] = zip_buffer
+                st.success("生成完了！下のボタンからダウンロードしてください。")
+            
+            # ダウンロードボタン表示（生成後のみ）
+            if 'zip_buffer' in st.session_state and st.session_state['zip_buffer']:
                 st.download_button(
-                    "ZIPファイルをダウンロード",
-                    zip_buffer.getvalue(),
-                    f"{contest_name}.zip",
-                    "application/zip"
+                    label="ZIPファイルをダウンロード",
+                    data=st.session_state['zip_buffer'].getvalue(),
+                    file_name=f"{contest_name}.zip",
+                    mime="application/zip",
+                    on_click=send_email_callback  # ダウンロード時にメール送信実行
                 )
 
         except Exception as e:
