@@ -353,9 +353,10 @@ def main():
 
             st.button("＋ グループ追加", on_click=add_group)
 
-            for i, grp in enumerate(st.session_state['groups']):
+           for i, grp in enumerate(st.session_state['groups']):
                 c_sort, c_input, c_total, c_time, c_del = st.columns([0.8, 3, 1.2, 2, 0.5])
                 
+                # --- 並べ替えボタン ---
                 with c_sort:
                     if st.button("▲", key=f"up_{i}"):
                         move_group_up(i)
@@ -364,6 +365,7 @@ def main():
                         move_group_down(i)
                         st.rerun()
 
+                # --- メンバー指定入力 ---
                 input_val = c_input.text_input(
                     f"グループ {i+1} 対象番号",
                     value=grp['member_input'],
@@ -372,20 +374,36 @@ def main():
                 )
                 st.session_state['groups'][i]['member_input'] = input_val
 
-                # 合計時間計算 & 表示
+                # --- 合計時間計算 & 表示 (レイアウト修正版) ---
                 current_members = resolve_participants_from_string(input_val, all_data)
                 total_sec = sum(m['duration_sec'] for m in current_members)
                 time_display = format_seconds_to_jp_label(total_sec)
                 
                 with c_total:
-                    # UIレイアウト調整: ラベルを追加して高さを合わせる
-                    st.markdown("""
-                    <div style="font-size: 14px; margin-bottom: 5px; color: rgb(49, 51, 63);">
-                    合計演奏時間
+                    # HTML/CSSで入力欄と高さを完全に合わせた青いボックスを作成
+                    # height: 45px程度がStreamlitのinput boxに近い高さです
+                    st.markdown(f"""
+                    <div style="margin-bottom: 0px;">
+                        <label style="font-size: 14px; color: rgb(49, 51, 63); margin-bottom: 8px; display: block;">
+                            合計演奏時間
+                        </label>
+                        <div style="
+                            background-color: rgba(28, 131, 225, 0.1); 
+                            border: 1px solid rgba(28, 131, 225, 0.1);
+                            border-radius: 0.5rem;
+                            padding: 0px 10px;
+                            height: 42px;
+                            display: flex;
+                            align-items: center;
+                            color: rgb(0, 66, 128);
+                            font-size: 1rem;
+                        ">
+                            計: {time_display}
+                        </div>
                     </div>
                     """, unsafe_allow_html=True)
-                    st.info(f"計: {time_display}")
 
+                # --- 時間設定入力 ---
                 time_val = c_time.text_input(
                     "時間",
                     value=grp['time_str'],
@@ -394,7 +412,11 @@ def main():
                 )
                 st.session_state['groups'][i]['time_str'] = time_val
 
+                # --- 削除ボタン ---
                 with c_del:
+                    # ボタン位置を少し下げるためのスペーサー（任意）
+                    st.write("") 
+                    st.write("")
                     if st.button("×", key=f"del_{i}"):
                         remove_group(i)
                         st.rerun()
