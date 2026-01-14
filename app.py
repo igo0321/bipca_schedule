@@ -199,7 +199,7 @@ def replace_text_in_document_full(doc, replacements):
                                 replace_text_smart(paragraph, replacements)
 
 # ---------------------------------------------------------
-# 2. メール送信機能（SSL対応版・添付ファイル名修正）
+# 2. メール送信機能（SSL対応版・添付ファイル名修正・使用者情報挿入）
 # ---------------------------------------------------------
 
 def send_email_callback():
@@ -224,6 +224,7 @@ def send_email_callback():
             return
 
     contest_name = st.session_state.get('contest_name', '無題')
+    user_email = st.session_state.get('user_email', '不明なユーザー')
     
     # ZIP内のファイルリストを取得して本文を作成
     file_list_str = ""
@@ -241,12 +242,14 @@ def send_email_callback():
     except Exception as e:
         file_list_str = f"（ファイル一覧取得エラー: {e}）"
 
-    # 生成日時
-    timestamp = datetime.now().strftime("%Y年%m月%d日%H時%M分")
+    # 生成日時（日本時間 UTC+9）
+    jst_now = datetime.utcnow() + timedelta(hours=9)
+    timestamp = jst_now.strftime("%Y年%m月%d日%H時%M分")
 
     # 件名と本文の構築
-    subject = f"採点表などを作成しました：{contest_name}"
-    body = f"""以下のファイルを生成しました。
+    subject = f"採点表等を作成しました：{contest_name}"
+    body = f"""{user_email}が以下のファイルを生成しました。
+
 {file_list_str}
 生成日時：{timestamp}"""
     
@@ -596,7 +599,32 @@ def generate_judges_list_doc(template_path_or_file, judges_list, global_context)
 # ---------------------------------------------------------
 def main():
     st.set_page_config(layout="wide", page_title="コンクール資料作成")
+    
+    # --- 0. メールアドレス確認 (Gateway) ---
+    if 'user_email' not in st.session_state:
+        st.session_state['user_email'] = None
+
+    if not st.session_state['user_email']:
+        st.title("🎹 コンクール運営資料ジェネレーター")
+        st.info("使用履歴を確認するため、メールアドレスの入力をお願いします。")
+        
+        with st.form("email_login_form"):
+            input_email = st.text_input("ご担当者様 メールアドレス", placeholder="example@example.com")
+            submit_login = st.form_submit_button("利用を開始する")
+            
+            if submit_login:
+                if input_email and "@" in input_email:
+                    st.session_state['user_email'] = input_email
+                    st.rerun()
+                else:
+                    st.error("有効なメールアドレスを入力してください。")
+        
+        # メールアドレス未入力時はここで処理を止める
+        st.stop()
+
+    # --- 以下、メインコンテンツ ---
     st.title("🎹 コンクール運営資料ジェネレーター (Word版)")
+    st.markdown(f"**ログイン中:** {st.session_state['user_email']}")
     
     # --- サイドバー: 設定読み込み ---
     with st.sidebar:
