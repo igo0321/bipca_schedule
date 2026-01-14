@@ -605,8 +605,8 @@ def main():
         st.session_state['user_email'] = None
 
     if not st.session_state['user_email']:
-        st.title("🎹 コンクール運営資料ジェネレーター")
-        st.info("使用履歴を確認するため、メールアドレスの入力をお願いします。")
+        st.title("コンクール運営資料ジェネレーター")
+        st.info("メールアドレスの入力をお願いします。")
         
         with st.form("email_login_form"):
             input_email = st.text_input("ご担当者様 メールアドレス", placeholder="example@example.com")
@@ -1010,3 +1010,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
