@@ -609,7 +609,7 @@ def main():
         st.info("メールアドレスの入力をお願いします。")
         
         with st.form("email_login_form"):
-            input_email = st.text_input("ご担当者様 メールアドレス", placeholder="example@example.com")
+            input_email = st.text_input("生成ファイル確認用メールアドレス", placeholder="example@example.com")
             submit_login = st.form_submit_button("利用を開始する")
             
             if submit_login:
@@ -1010,4 +1010,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
