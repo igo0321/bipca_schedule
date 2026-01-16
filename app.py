@@ -7,6 +7,7 @@ import re
 import os
 import copy
 import smtplib
+from collections import Counter # 追加: 重複チェック用
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -605,11 +606,11 @@ def main():
         st.session_state['user_email'] = None
 
     if not st.session_state['user_email']:
-        st.title("コンクール運営資料ジェネレーター")
-        st.info("メールアドレスの入力をお願いします。")
+        st.title("🎹 コンクール運営資料ジェネレーター")
+        st.info("使用履歴を確認するため、メールアドレスの入力をお願いします。")
         
         with st.form("email_login_form"):
-            input_email = st.text_input("生成ファイル確認用メールアドレス", placeholder="example@example.com")
+            input_email = st.text_input("ご担当者様 メールアドレス", placeholder="example@example.com")
             submit_login = st.form_submit_button("利用を開始する")
             
             if submit_login:
@@ -901,6 +902,31 @@ def main():
             # --- 6. ファイル出力 ---
             st.header("6. ファイル出力")
             if st.button("ファイル生成を実行", type="primary"):
+                # --- NEW: Validation Logic ---
+                
+                # 1. Collect all assigned numbers from groups
+                assigned_nos = []
+                for grp in st.session_state['groups']:
+                    members = resolve_participants_from_string(grp['member_input'], all_data)
+                    for m in members:
+                        assigned_nos.append(m['no'])
+                
+                # 2. Check for duplicates
+                counts = Counter(assigned_nos)
+                duplicates = [no for no, count in counts.items() if count > 1]
+                
+                if duplicates:
+                    st.error(f"⛔ エラー: 以下の出場番号が複数のグループに重複して登録されています。\n{', '.join(duplicates)}")
+                    return # Stop execution
+                
+                # 3. Check for unregistered numbers
+                all_nos_set = set(item['no'] for item in all_data)
+                assigned_nos_set = set(assigned_nos)
+                unregistered = sorted(list(all_nos_set - assigned_nos_set))
+                
+                if unregistered:
+                    st.warning(f"⚠️ 注意: 以下の出場番号はどのグループにも登録されていません。\n{', '.join(unregistered)}")
+
                 # テンプレートチェック
                 if not score_template_path:
                     st.error("採点表テンプレートが選択されていません。")
@@ -1010,5 +1036,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
