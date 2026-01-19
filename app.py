@@ -556,15 +556,15 @@ def load_settings_from_json(json_data):
 def main():
     st.set_page_config(layout="wide", page_title="コンクール資料作成")
     
-    # 初期化
+    # 初期化 (修正: デフォルトで空リストにしておく)
     if 'config_version' not in st.session_state:
         st.session_state['config_version'] = 0
     if 'last_loaded_json_name' not in st.session_state:
         st.session_state['last_loaded_json_name'] = None
     if 'groups' not in st.session_state:
-        st.session_state['groups'] = [{'member_input': '', 'time_str': '13:00-14:10'}]
+        st.session_state['groups'] = [] # ここ重要！ 最初は空。デフォルト値はいれない。
     if 'judges' not in st.session_state:
-        st.session_state['judges'] = ["審査員A"]
+        st.session_state['judges'] = [] # ここ重要！ 最初は空。
     if 'saved_excel_config' not in st.session_state:
         st.session_state['saved_excel_config'] = None
     if 'contest_details' not in st.session_state:
@@ -572,6 +572,8 @@ def main():
             'date': '', 'hall': '', 'open': '10:00', 'reception': '10:45-15:30',
             'start': '11:00', 'end': '14:00', 'result': '', 'method': '公式サイト上で掲載'
         }
+    if 'contest_name' not in st.session_state:
+        st.session_state['contest_name'] = "第10回BIPCA 東京予選④"
 
     # --- 0. メールアドレス確認 (Gateway) ---
     if 'user_email' not in st.session_state:
@@ -597,503 +599,390 @@ def main():
     st.title("🎹 コンクール運営資料ジェネレーター (Word版)")
     st.markdown(f"**ログイン中:** {st.session_state['user_email']}")
     
-    # バージョン番号の取得（ウィジェットKey生成用）
     ver = st.session_state['config_version']
 
-    # --- サイドバー: 設定読み込み ---
-    with st.sidebar:
-        st.header("⚙️ 設定管理")
-        
-        # キーは固定し、読み込み処理でrerunを使わない方式に変更
-        uploaded_config = st.file_uploader(
-            "設定ファイル(JSON)を読み込む", 
-            type=['json'], 
-            key="json_config_uploader_fixed" 
-        )
-
-        if uploaded_config:
-            if uploaded_config.name != st.session_state['last_loaded_json_name']:
-                try:
-                    # 明示的にUTF-8で読み込む
-                    content = uploaded_config.getvalue().decode("utf-8")
-                    config_data = json.loads(content)
-                    
-                    # 設定ロード & バージョンアップ
-                    load_settings_from_json(config_data)
-                    
-                    # 読み込み済みフラグ更新
-                    st.session_state['last_loaded_json_name'] = uploaded_config.name
-                    st.success("設定を読み込みました。")
-                    
-                    # ここで st.rerun() は呼ばない！
-                    # verが増えたので、この後の処理で自動的に新しいウィジェットが生成され、値が反映される。
-                    
-                except Exception as e:
-                    st.error(f"設定読み込みエラー: {e}")
-        else:
-            st.session_state['last_loaded_json_name'] = None
-
-    # --- 1. 名簿データ (Excel) ---
-    st.header("1. 名簿データ (Excel)")
+    # --- Step 1. 名簿データ (Excel) - 必須 ---
+    st.header("Step 1. 名簿データ (Excel) をアップロード")
+    st.info("まずはExcelファイルをアップロードしてください。設定メニューはその後表示されます。")
     
     uploaded_excel = st.file_uploader(
         "名簿Excelファイルをアップロード", 
         type=['xlsx', 'xls', 'csv'], 
         key="excel_uploader_fixed"
     )
-    
+
+    if not uploaded_excel:
+        st.stop() # Excelがないとここで止まる（下のUIが出ない）
+
+    # --- Excel読み込み処理 ---
     all_data = []
     excel_config_to_save = {}
     
-    if uploaded_excel:
-        try:
-            # --- シート選択ロジック (保存された設定の優先使用) ---
-            saved_config = st.session_state.get('saved_excel_config', {})
-            saved_sheet = saved_config.get('sheet_name') if saved_config else None
+    try:
+        # シート選択など
+        saved_config = st.session_state.get('saved_excel_config', {})
+        saved_sheet = saved_config.get('sheet_name') if saved_config else None
+        
+        df = None
+        selected_sheet = None
+        
+        if uploaded_excel.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_excel)
+            selected_sheet = "CSV"
+        else:
+            xls = pd.ExcelFile(uploaded_excel)
+            sheet_names = xls.sheet_names
             
-            df = None
-            selected_sheet = None
+            # デフォルトインデックスの決定
+            default_sheet_idx = 0
+            if saved_sheet and saved_sheet in sheet_names:
+                default_sheet_idx = sheet_names.index(saved_sheet)
             
-            if uploaded_excel.name.endswith('.csv'):
-                df = pd.read_csv(uploaded_excel)
-                selected_sheet = "CSV"
-            else:
-                xls = pd.ExcelFile(uploaded_excel)
-                sheet_names = xls.sheet_names
-                
-                # デフォルトインデックスの決定
-                default_sheet_idx = 0
-                if saved_sheet and saved_sheet in sheet_names:
-                    default_sheet_idx = sheet_names.index(saved_sheet)
-                
-                # セレクトボックスはバージョン依存で再生成させる (設定反映のため)
-                selected_sheet = st.selectbox("シートを選択", sheet_names, index=default_sheet_idx, key=f"sheet_sel_{ver}")
-                df = pd.read_excel(uploaded_excel, sheet_name=selected_sheet)
+            # Excel設定後、シート選択
+            selected_sheet = st.selectbox("シートを選択", sheet_names, index=default_sheet_idx, key=f"sheet_sel_{ver}")
+            df = pd.read_excel(uploaded_excel, sheet_name=selected_sheet)
 
-            # Excel設定保存用
-            excel_config_to_save['sheet_name'] = selected_sheet
+        excel_config_to_save['sheet_name'] = selected_sheet
+        cols = df.columns.tolist()
 
-            # --- 列の割り当てロジック (保存された設定の優先使用) ---
-            cols = df.columns.tolist()
+    except Exception as e:
+        st.error(f"Excel読み込みエラー: {e}")
+        st.stop()
+
+    # --- Step 2. 設定JSONの読み込み (任意) ---
+    st.header("Step 2. 過去の設定を読み込む (任意)")
+    st.markdown("以前保存した `設定データ.json` がある場合はここで読み込んでください。")
+
+    uploaded_config = st.file_uploader(
+        "設定ファイル(JSON)を読み込む", 
+        type=['json'], 
+        key="json_config_uploader_fixed" 
+    )
+
+    if uploaded_config:
+        if uploaded_config.name != st.session_state['last_loaded_json_name']:
+            try:
+                content = uploaded_config.getvalue().decode("utf-8")
+                config_data = json.loads(content)
+                load_settings_from_json(config_data)
+                st.session_state['last_loaded_json_name'] = uploaded_config.name
+                st.success("設定を読み込みました。")
+            except Exception as e:
+                st.error(f"設定読み込みエラー: {e}")
+    else:
+        st.session_state['last_loaded_json_name'] = None
+
+    # --- ★重要: デフォルト値生成ロジック ---
+    # JSON読み込みフェーズが終わっても、まだリストが空の場合（＝JSONなし、初回起動時）
+    # ここで初めてデフォルト値をセットする。これで「JSONがあるのにデフォルト値で上書き」を防げる。
+    if not st.session_state['groups']:
+        st.session_state['groups'] = [{'member_input': '', 'time_str': '13:00-14:10'}]
+    if not st.session_state['judges']:
+        st.session_state['judges'] = ["審査員A"]
+
+    # --- Step 3. 各種詳細設定 ---
+    st.header("Step 3. 詳細設定と出力")
+
+    # 列の割り当て
+    st.subheader("3-1. 列の割り当て")
+    def get_col_index(saved_key, default_heuristic_cols, all_cols, fallback_index=0):
+        if saved_config and saved_key in saved_config:
+            val = saved_config[saved_key]
+            if val in all_cols: return all_cols.index(val)
+        for h in default_heuristic_cols:
+            if h in all_cols: return all_cols.index(h)
+        return fallback_index
+
+    c1, c2, c3, c4 = st.columns(4)
+    idx_no = get_col_index('col_no', ["出場番号", "No", "No."], cols, 0)
+    col_no = c1.selectbox("出場番号", cols, index=idx_no, key=f"c_no_{ver}")
+
+    idx_name = get_col_index('col_name', ["氏名", "名前"], cols, 0)
+    col_name = c2.selectbox("氏名", cols, index=idx_name, key=f"c_name_{ver}")
+    
+    kana_options = ["(なし)"] + cols
+    idx_kana = 0
+    if saved_config and 'col_kana' in saved_config:
+        if saved_config['col_kana'] in kana_options: idx_kana = kana_options.index(saved_config['col_kana'])
+    elif "フリガナ" in cols:
+        idx_kana = cols.index("フリガナ") + 1
+    col_kana = c3.selectbox("フリガナ (任意)", kana_options, index=idx_kana, key=f"c_kana_{ver}")
+    
+    idx_song = get_col_index('col_song', ["演奏曲目", "曲目"], cols, 0)
+    col_song = c4.selectbox("演奏曲目", cols, index=idx_song, key=f"c_song_{ver}")
+    
+    c5, c6, c7 = st.columns(3)
+    age_options = ["(なし)"] + cols
+    idx_age = 0
+    if saved_config and 'col_age' in saved_config:
+            if saved_config['col_age'] in age_options: idx_age = age_options.index(saved_config['col_age'])
+    elif "年齢" in cols:
+            idx_age = cols.index("年齢") + 1
+    col_age = c5.selectbox("年齢列 (任意)", age_options, index=idx_age, key=f"c_age_{ver}")
+
+    tel_options = ["(なし)"] + cols
+    idx_tel = 0
+    if saved_config and 'col_tel' in saved_config:
+            if saved_config['col_tel'] in tel_options: idx_tel = tel_options.index(saved_config['col_tel'])
+    elif "電話番号" in cols:
+            idx_tel = cols.index("電話番号") + 1
+    col_tel = c6.selectbox("電話番号列 (受付表用)", tel_options, index=idx_tel, key=f"c_tel_{ver}")
+
+    dur_options = ["(なし)"] + cols
+    idx_dur = 0
+    if saved_config and 'col_duration' in saved_config:
+            if saved_config['col_duration'] in dur_options: idx_dur = dur_options.index(saved_config['col_duration'])
+    elif "演奏時間" in cols:
+            idx_dur = cols.index("演奏時間") + 1
+    col_duration = c7.selectbox("演奏時間列 (自動計算用)", dur_options, index=idx_dur, key=f"c_dur_{ver}")
+
+    excel_config_to_save.update({
+        'col_no': col_no, 'col_name': col_name, 'col_kana': col_kana,
+        'col_song': col_song, 'col_age': col_age, 'col_tel': col_tel, 'col_duration': col_duration
+    })
+
+    # データ構築
+    for _, row in df.iterrows():
+        kana_val = str(row[col_kana]) if col_kana != "(なし)" else ""
+        age_val = str(row[col_age]) if col_age != "(なし)" else ""
+        tel_val = str(row[col_tel]) if col_tel != "(なし)" else ""
+        dur_seconds = 0
+        if col_duration != "(なし)":
+            raw_dur = str(row[col_duration])
+            dur_seconds = parse_jp_time_to_seconds(raw_dur)
+
+        all_data.append({
+            'no': str(row[col_no]), 'name': str(row[col_name]),
+            'kana': kana_val, 'song': str(row[col_song]),
+            'age': age_val, 'tel': tel_val, 'duration_sec': dur_seconds
+        })
+    st.write(f"読み込み完了: {len(all_data)} 件のデータ")
+
+    st.markdown("---")
+
+    # テンプレート選択
+    st.subheader("3-2. Wordテンプレート選択")
+    TEMPLATE_DIR = "templates"
+    template_files = []
+    if os.path.exists(TEMPLATE_DIR):
+        template_files = [f for f in os.listdir(TEMPLATE_DIR) if f.endswith(".docx") and not f.startswith("~$")]
+    
+    score_template_path = None
+    reception_template_path = None
+    web_template_path = None
+    judges_list_template_path = None
+    use_manual_upload = False
+
+    if template_files:
+        idx_score = 0; idx_reception = 0; idx_web = 0; idx_judges = 0
+        for i, f in enumerate(template_files):
+            if "採点表" in f: idx_score = i
+            if "受付表" in f: idx_reception = i
+            if "WEB" in f or "プログラム" in f: idx_web = i
+            if "審査員" in f and "リスト" not in f: idx_judges = i
+        
+        col_t1, col_t2 = st.columns(2)
+        col_t3, col_t4 = st.columns(2)
+        with col_t1:
+            selected_score_file = st.selectbox("採点表テンプレート", template_files, index=idx_score, key=f"tpl_sc_{ver}")
+            score_template_path = os.path.join(TEMPLATE_DIR, selected_score_file)
+        with col_t2:
+            selected_reception_file = st.selectbox("受付表テンプレート", template_files, index=idx_reception, key=f"tpl_rc_{ver}")
+            reception_template_path = os.path.join(TEMPLATE_DIR, selected_reception_file)
+        with col_t3:
+            selected_web_file = st.selectbox("WEBプログラムテンプレート", template_files, index=idx_web, key=f"tpl_wb_{ver}")
+            web_template_path = os.path.join(TEMPLATE_DIR, selected_web_file)
+        with col_t4:
+            selected_judges_file = st.selectbox("審査員リストテンプレート", template_files, index=idx_judges, key=f"tpl_jd_{ver}")
+            judges_list_template_path = os.path.join(TEMPLATE_DIR, selected_judges_file)
+        
+        if st.checkbox("テンプレートを手動でアップロードする", key=f"chk_manual_{ver}"):
+            use_manual_upload = True
+    else:
+        st.warning("templatesフォルダが見つからないため、手動アップロードモードになります。")
+        use_manual_upload = True
+
+    if use_manual_upload:
+        c_up1, c_up2 = st.columns(2); c_up3, c_up4 = st.columns(2)
+        uploaded_score_template = c_up1.file_uploader("採点表テンプレート (.docx)", type=['docx'], key=f"up_sc_{ver}")
+        uploaded_reception_template = c_up2.file_uploader("受付表テンプレート (.docx)", type=['docx'], key=f"up_rc_{ver}")
+        uploaded_web_template = c_up3.file_uploader("WEBプログラムテンプレート (.docx)", type=['docx'], key=f"up_wb_{ver}")
+        uploaded_judges_template = c_up4.file_uploader("審査員リストテンプレート (.docx)", type=['docx'], key=f"up_jd_{ver}")
+        
+        if uploaded_score_template: score_template_path = uploaded_score_template
+        if uploaded_reception_template: reception_template_path = uploaded_reception_template
+        if uploaded_web_template: web_template_path = uploaded_web_template
+        if uploaded_judges_template: judges_list_template_path = uploaded_judges_template
+
+    st.markdown("---")
+
+    # グループ設定
+    st.subheader("3-3. グループ・スケジュール設定")
+    def add_group(): st.session_state['groups'].append({'member_input': '', 'time_str': ''})
+    def move_group_up(idx):
+        if idx > 0: st.session_state['groups'][idx], st.session_state['groups'][idx-1] = st.session_state['groups'][idx-1], st.session_state['groups'][idx]
+    def move_group_down(idx):
+        if idx < len(st.session_state['groups']) - 1: st.session_state['groups'][idx], st.session_state['groups'][idx+1] = st.session_state['groups'][idx+1], st.session_state['groups'][idx]
+    def remove_group(idx): st.session_state['groups'].pop(idx)
+
+    st.button("＋ グループ追加", on_click=add_group, key=f"btn_add_grp_{ver}")
+
+    for i, grp in enumerate(st.session_state['groups']):
+        c_sort, c_input, c_total, c_time, c_del = st.columns([0.8, 3, 1.2, 2, 0.5])
+        with c_sort:
+            if st.button("▲", key=f"up_{i}_{ver}"): move_group_up(i); st.rerun()
+            if st.button("▼", key=f"down_{i}_{ver}"): move_group_down(i); st.rerun()
+
+        input_val = c_input.text_input(f"グループ {i+1} 対象番号", value=grp['member_input'], key=f"g_in_{i}_{ver}", placeholder="例: A01-A05, C01")
+        st.session_state['groups'][i]['member_input'] = input_val
+        
+        current_members = resolve_participants_from_string(input_val, all_data)
+        total_sec = sum(m['duration_sec'] for m in current_members)
+        
+        with c_total:
+             st.markdown(f"<div style='margin-top: 1.8rem; font-weight:bold; color: #004280;'>計: {format_seconds_to_jp_label(total_sec)}</div>", unsafe_allow_html=True)
+
+        time_val = c_time.text_input("時間", value=grp['time_str'], key=f"g_time_{i}_{ver}", placeholder="例: 13:00-14:00")
+        st.session_state['groups'][i]['time_str'] = time_val
+
+        with c_del:
+            st.markdown("<div style='margin-top: 1.8rem;'></div>", unsafe_allow_html=True)
+            if st.button("×", key=f"del_{i}_{ver}"): remove_group(i); st.rerun()
+
+    # 審査員設定
+    st.subheader("3-4. 審査員設定")
+    def add_judge(): st.session_state['judges'].append("")
+    st.button("＋ 審査員追加", on_click=add_judge, key=f"btn_add_jdg_{ver}")
+    
+    for i in range(len(st.session_state['judges'])):
+        val = st.text_input(f"審査員 {i+1}", value=st.session_state['judges'][i], key=f"judge_input_{i}_{ver}")
+        st.session_state['judges'][i] = val
+
+    contest_name = st.text_input("コンクール名 (ファイル名等に使用)", value=st.session_state['contest_name'], key=f"input_contest_name_{ver}")
+    st.session_state['contest_name'] = contest_name
+
+    # 審査会詳細
+    st.subheader("3-5. 審査会詳細")
+    det_current = st.session_state['contest_details']
+    def on_date_change():
+        v = st.session_state['config_version']
+        current_date = st.session_state.get(f"detail_date_{v}", "")
+        calculated = calculate_next_day_morning(current_date)
+        if calculated: st.session_state['contest_details']['result'] = calculated
+
+    col_d1, col_d2 = st.columns(2)
+    date_val = col_d1.text_input("開催日時 (例: 2025年12月21日)", value=det_current['date'], key=f"detail_date_{ver}", on_change=on_date_change)
+    hall_val = col_d2.text_input("会場", value=det_current['hall'], key=f"detail_hall_{ver}")
+    
+    col_d3, col_d4, col_d5, col_d6 = st.columns(4)
+    open_val = col_d3.text_input("開場時刻", value=det_current['open'], key=f"detail_open_{ver}")
+    start_val = col_d4.text_input("審査開始", value=det_current['start'], key=f"detail_start_{ver}")
+    end_val = col_d5.text_input("審査終了", value=det_current['end'], key=f"detail_end_{ver}")
+    reception_val = col_d6.text_input("受付時間", value=det_current['reception'], key=f"detail_reception_{ver}")
+
+    col_d7, col_d8 = st.columns(2)
+    result_val = col_d7.text_input("結果発表日時", value=det_current['result'], key=f"detail_result_{ver}")
+    method_options = ["公式サイト上で掲載", "会場ロビーもしくはホワイエで掲載", "表彰式にて発表", "その他"]
+    curr_method = det_current.get('method', "公式サイト上で掲載")
+    idx_method = method_options.index(curr_method) if curr_method in method_options else 0
+    method_val = col_d8.selectbox("結果発表方式", method_options, index=idx_method, key=f"detail_method_{ver}")
+
+    det_updated = {
+        'date': date_val, 'hall': hall_val, 'open': open_val, 
+        'start': start_val, 'end': end_val, 'reception': reception_val, 
+        'result': result_val, 'method': method_val
+    }
+    st.session_state['contest_details'] = det_updated
+
+    # --- ファイル出力 ---
+    st.header("Step 4. ファイル生成")
+    if st.button("ファイル生成を実行", type="primary", key=f"btn_gen_{ver}"):
+        # バリデーション
+        assigned_nos = []
+        for grp in st.session_state['groups']:
+            members = resolve_participants_from_string(grp['member_input'], all_data)
+            for m in members: assigned_nos.append(m['no'])
+        
+        counts = Counter(assigned_nos)
+        duplicates = [no for no, count in counts.items() if count > 1]
+        if duplicates:
+            st.error(f"⛔ エラー: 出場番号重複: {', '.join(duplicates)}")
+            return
+        
+        if not score_template_path:
+            st.error("採点表テンプレートが選択されていません。")
+            return
+
+        valid_judges = [j for j in st.session_state['judges'] if j.strip()]
+        details_formatted = {
+            'contest_date': det_updated['date'], 'contest_hall': det_updated['hall'],
+            'contest_open': format_single_time_label(det_updated['open']),
+            'contest_reception': format_time_label(det_updated['reception']),
+            'contest_start': format_single_time_label(det_updated['start']),
+            'contest_end': format_single_time_label(det_updated['end']),
+            'contest_result': det_updated['result'], 'contest_method': det_updated['method']
+        }
+
+        config_json = json.dumps({
+            'groups': st.session_state['groups'], 'judges': valid_judges,
+            'contest_name': contest_name, 'contest_details': det_updated,
+            'excel_config': excel_config_to_save
+        }, ensure_ascii=False, indent=2)
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            base_context = {'contest_name': contest_name, **details_formatted}
             
-            def get_col_index(saved_key, default_heuristic_cols, all_cols, fallback_index=0):
-                # 1. 保存された設定があればそれを使う
-                if saved_config and saved_key in saved_config:
-                    val = saved_config[saved_key]
-                    if val in all_cols:
-                        return all_cols.index(val)
-                # 2. ヒューリスティック
-                for h in default_heuristic_cols:
-                    if h in all_cols:
-                        return all_cols.index(h)
-                # 3. フォールバック
-                return fallback_index
+            for judge in valid_judges:
+                try:
+                    if hasattr(score_template_path, 'seek'): score_template_path.seek(0)
+                    context = base_context.copy(); context['judge_name'] = judge
+                    doc_io = generate_word_from_template(score_template_path, st.session_state['groups'], all_data, context)
+                    zf.writestr(f"採点表_{judge}.docx", doc_io.getvalue())
+                except Exception as e: st.error(f"採点表生成エラー ({judge}): {e}")
 
-            c1, c2, c3, c4 = st.columns(4)
+            if reception_template_path:
+                try:
+                    if hasattr(reception_template_path, 'seek'): reception_template_path.seek(0)
+                    context = base_context.copy(); context['judge_name'] = '受付用'
+                    doc_io = generate_word_from_template(reception_template_path, st.session_state['groups'], all_data, context)
+                    zf.writestr("受付表.docx", doc_io.getvalue())
+                except: pass
+
+            if web_template_path:
+                try:
+                    if hasattr(web_template_path, 'seek'): web_template_path.seek(0)
+                    context = base_context.copy(); context['judge_name'] = ''
+                    doc_io = generate_web_program_doc(web_template_path, st.session_state['groups'], all_data, context)
+                    zf.writestr("WEBプログラム.docx", doc_io.getvalue())
+                except: pass
             
-            # 各セレクトボックスは {ver} をキーに含めることで、JSONロード時に初期選択位置を再計算させる
-            idx_no = get_col_index('col_no', ["出場番号", "No", "No."], cols, 0)
-            col_no = c1.selectbox("出場番号", cols, index=idx_no, key=f"c_no_{ver}")
+            if judges_list_template_path:
+                try:
+                    if hasattr(judges_list_template_path, 'seek'): judges_list_template_path.seek(0)
+                    context = base_context.copy()
+                    doc_io = generate_judges_list_doc(judges_list_template_path, valid_judges, context)
+                    zf.writestr("本日の審査員.docx", doc_io.getvalue())
+                except: pass
 
-            idx_name = get_col_index('col_name', ["氏名", "名前"], cols, 0)
-            col_name = c2.selectbox("氏名", cols, index=idx_name, key=f"c_name_{ver}")
-            
-            kana_options = ["(なし)"] + cols
-            idx_kana = 0
-            if saved_config and 'col_kana' in saved_config:
-                if saved_config['col_kana'] in kana_options:
-                    idx_kana = kana_options.index(saved_config['col_kana'])
-            elif "フリガナ" in cols:
-                idx_kana = cols.index("フリガナ") + 1
-            col_kana = c3.selectbox("フリガナ (任意)", kana_options, index=idx_kana, key=f"c_kana_{ver}")
-            
-            idx_song = get_col_index('col_song', ["演奏曲目", "曲目"], cols, 0)
-            col_song = c4.selectbox("演奏曲目", cols, index=idx_song, key=f"c_song_{ver}")
-            
-            c5, c6, c7 = st.columns(3)
-            
-            age_options = ["(なし)"] + cols
-            idx_age = 0
-            if saved_config and 'col_age' in saved_config:
-                 if saved_config['col_age'] in age_options: idx_age = age_options.index(saved_config['col_age'])
-            elif "年齢" in cols:
-                 idx_age = cols.index("年齢") + 1
-            col_age = c5.selectbox("年齢列 (任意)", age_options, index=idx_age, key=f"c_age_{ver}")
-
-            tel_options = ["(なし)"] + cols
-            idx_tel = 0
-            if saved_config and 'col_tel' in saved_config:
-                 if saved_config['col_tel'] in tel_options: idx_tel = tel_options.index(saved_config['col_tel'])
-            elif "電話番号" in cols:
-                 idx_tel = cols.index("電話番号") + 1
-            col_tel = c6.selectbox("電話番号列 (受付表用)", tel_options, index=idx_tel, key=f"c_tel_{ver}")
-
-            dur_options = ["(なし)"] + cols
-            idx_dur = 0
-            if saved_config and 'col_duration' in saved_config:
-                 if saved_config['col_duration'] in dur_options: idx_dur = dur_options.index(saved_config['col_duration'])
-            elif "演奏時間" in cols:
-                 idx_dur = cols.index("演奏時間") + 1
-            col_duration = c7.selectbox("演奏時間列 (自動計算用)", dur_options, index=idx_dur, key=f"c_dur_{ver}")
-
-            excel_config_to_save.update({
-                'col_no': col_no,
-                'col_name': col_name,
-                'col_kana': col_kana,
-                'col_song': col_song,
-                'col_age': col_age,
-                'col_tel': col_tel,
-                'col_duration': col_duration
-            })
-
-            st.markdown("---")
-
-            for _, row in df.iterrows():
-                kana_val = str(row[col_kana]) if col_kana != "(なし)" else ""
-                age_val = str(row[col_age]) if col_age != "(なし)" else ""
-                tel_val = str(row[col_tel]) if col_tel != "(なし)" else ""
-                dur_seconds = 0
-                if col_duration != "(なし)":
-                    raw_dur = str(row[col_duration])
-                    dur_seconds = parse_jp_time_to_seconds(raw_dur)
-
-                all_data.append({
-                    'no': str(row[col_no]), 
-                    'name': str(row[col_name]),
-                    'kana': kana_val,
-                    'song': str(row[col_song]),
-                    'age': age_val,
-                    'tel': tel_val,
-                    'duration_sec': dur_seconds
-                })
-            
-            st.write(f"読み込み完了: {len(all_data)} 件のデータ")
-
-            # --- 2. テンプレート選択 ---
-            st.header("2. Wordテンプレート選択")
-            
-            TEMPLATE_DIR = "templates"
-            template_files = []
             if os.path.exists(TEMPLATE_DIR):
-                template_files = [f for f in os.listdir(TEMPLATE_DIR) if f.endswith(".docx") and not f.startswith("~$")]
-            
-            score_template_path = None
-            reception_template_path = None
-            web_template_path = None
-            judges_list_template_path = None
-            use_manual_upload = False
+                for f in os.listdir(TEMPLATE_DIR):
+                    if f.endswith(".pdf"): zf.write(os.path.join(TEMPLATE_DIR, f), arcname=f)
 
-            if template_files:
-                idx_score = 0
-                idx_reception = 0
-                idx_web = 0
-                idx_judges = 0
-                for i, f in enumerate(template_files):
-                    if "採点表" in f: idx_score = i
-                    if "受付表" in f: idx_reception = i
-                    if "WEB" in f or "プログラム" in f: idx_web = i
-                    if "審査員" in f and "リスト" not in f: idx_judges = i
-                
-                col_t1, col_t2 = st.columns(2)
-                col_t3, col_t4 = st.columns(2)
-                
-                with col_t1:
-                    selected_score_file = st.selectbox("採点表テンプレート", template_files, index=idx_score, key=f"tpl_sc_{ver}")
-                    score_template_path = os.path.join(TEMPLATE_DIR, selected_score_file)
-                with col_t2:
-                    selected_reception_file = st.selectbox("受付表テンプレート", template_files, index=idx_reception, key=f"tpl_rc_{ver}")
-                    reception_template_path = os.path.join(TEMPLATE_DIR, selected_reception_file)
-                with col_t3:
-                    selected_web_file = st.selectbox("WEBプログラムテンプレート", template_files, index=idx_web, key=f"tpl_wb_{ver}")
-                    web_template_path = os.path.join(TEMPLATE_DIR, selected_web_file)
-                with col_t4:
-                    selected_judges_file = st.selectbox("審査員リストテンプレート", template_files, index=idx_judges, key=f"tpl_jd_{ver}")
-                    judges_list_template_path = os.path.join(TEMPLATE_DIR, selected_judges_file)
-                
-                if st.checkbox("テンプレートを手動でアップロードする", key=f"chk_manual_{ver}"):
-                    use_manual_upload = True
-            else:
-                st.warning("templatesフォルダが見つからないか、docxファイルがありません。手動アップロードモードに切り替えます。")
-                use_manual_upload = True
-
-            if use_manual_upload:
-                c_up1, c_up2 = st.columns(2)
-                c_up3, c_up4 = st.columns(2)
-                uploaded_score_template = c_up1.file_uploader("採点表テンプレート (.docx)", type=['docx'], key=f"up_sc_{ver}")
-                uploaded_reception_template = c_up2.file_uploader("受付表テンプレート (.docx)", type=['docx'], key=f"up_rc_{ver}")
-                uploaded_web_template = c_up3.file_uploader("WEBプログラムテンプレート (.docx)", type=['docx'], key=f"up_wb_{ver}")
-                uploaded_judges_template = c_up4.file_uploader("審査員リストテンプレート (.docx)", type=['docx'], key=f"up_jd_{ver}")
-                
-                if uploaded_score_template: score_template_path = uploaded_score_template
-                if uploaded_reception_template: reception_template_path = uploaded_reception_template
-                if uploaded_web_template: web_template_path = uploaded_web_template
-                if uploaded_judges_template: judges_list_template_path = uploaded_judges_template
-
-            # --- 3. グループ・スケジュール設定 (Dynamic Key Implemented) ---
-            st.header("3. グループ・スケジュール設定")
-            
-            def add_group():
-                st.session_state['groups'].append({'member_input': '', 'time_str': ''})
-            def move_group_up(idx):
-                if idx > 0:
-                    st.session_state['groups'][idx], st.session_state['groups'][idx-1] = st.session_state['groups'][idx-1], st.session_state['groups'][idx]
-            def move_group_down(idx):
-                if idx < len(st.session_state['groups']) - 1:
-                    st.session_state['groups'][idx], st.session_state['groups'][idx+1] = st.session_state['groups'][idx+1], st.session_state['groups'][idx]
-            def remove_group(idx):
-                st.session_state['groups'].pop(idx)
-
-            st.button("＋ グループ追加", on_click=add_group, key=f"btn_add_grp_{ver}")
-
-            for i, grp in enumerate(st.session_state['groups']):
-                c_sort, c_input, c_total, c_time, c_del = st.columns([0.8, 3, 1.2, 2, 0.5])
-                
-                with c_sort:
-                    if st.button("▲", key=f"up_{i}_{ver}"):
-                        move_group_up(i)
-                        st.rerun()
-                    if st.button("▼", key=f"down_{i}_{ver}"):
-                        move_group_down(i)
-                        st.rerun()
-
-                input_val = c_input.text_input(
-                    f"グループ {i+1} 対象番号",
-                    value=grp['member_input'],
-                    key=f"g_in_{i}_{ver}",
-                    placeholder="例: A01-A05, C01"
-                )
-                st.session_state['groups'][i]['member_input'] = input_val
-
-                current_members = resolve_participants_from_string(input_val, all_data)
-                total_sec = sum(m['duration_sec'] for m in current_members)
-                time_display = format_seconds_to_jp_label(total_sec)
-                
-                with c_total:
-                    st.markdown(f"""
-                    <div style="margin-bottom: 0px;">
-                        <label style="font-size: 14px; color: rgb(49, 51, 63); margin-bottom: 0.5rem; display: block;">
-                            合計演奏時間
-                        </label>
-                        <div style="
-                            background-color: rgba(28, 131, 225, 0.1); 
-                            border: 1px solid rgba(28, 131, 225, 0.1);
-                            border-radius: 0.5rem;
-                            padding: 0px 10px;
-                            min-height: 2.5rem;
-                            height: auto;
-                            display: flex;
-                            align-items: center;
-                            color: rgb(0, 66, 128);
-                            font-size: 1rem;
-                            line-height: 1.5;
-                        ">
-                            計: {time_display}
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                time_val = c_time.text_input(
-                    "時間",
-                    value=grp['time_str'],
-                    key=f"g_time_{i}_{ver}",
-                    placeholder="例: 13:00-14:00"
-                )
-                st.session_state['groups'][i]['time_str'] = time_val
-
-                with c_del:
-                    st.markdown("<div style='margin-top: 1.8rem;'></div>", unsafe_allow_html=True)
-                    if st.button("×", key=f"del_{i}_{ver}"):
-                        remove_group(i)
-                        st.rerun()
-
-            # --- 4. 審査員設定 (Dynamic Key Implemented) ---
-            st.header("4. 審査員設定")
-            
-            def add_judge():
-                st.session_state['judges'].append("")
-            
-            st.button("＋ 審査員追加", on_click=add_judge, key=f"btn_add_jdg_{ver}")
-
-            # ループでウィジェット生成。Keyにverを含めることで、JSONロード時に強制リフレッシュ
-            for i in range(len(st.session_state['judges'])):
-                val = st.text_input(
-                    f"審査員 {i+1}", 
-                    value=st.session_state['judges'][i], 
-                    key=f"judge_input_{i}_{ver}" 
-                )
-                st.session_state['judges'][i] = val
-
-            contest_name = st.text_input("コンクール名 (ファイル名等に使用)", 
-                                         value=st.session_state['contest_name'],
-                                         key=f"input_contest_name_{ver}")
-            st.session_state['contest_name'] = contest_name
-
-            # --- 5. 審査会詳細 (Dynamic Key Implemented) ---
-            st.header("5. 審査会詳細")
-            st.info("※ここで入力した内容はWord出力時に自動的に形式変換されて挿入されます。")
-            
-            det_current = st.session_state['contest_details']
-
-            def on_date_change():
-                # Dynamic Keyから現在の値を取得して計算
-                v = st.session_state['config_version']
-                current_date = st.session_state.get(f"detail_date_{v}", "")
-                calculated = calculate_next_day_morning(current_date)
-                if calculated:
-                    # 結果発表日時を更新
-                    st.session_state['contest_details']['result'] = calculated
-            
-            col_d1, col_d2 = st.columns(2)
-            date_val = col_d1.text_input("開催日時 (例: 2025年12月21日)", value=det_current['date'], key=f"detail_date_{ver}", on_change=on_date_change)
-            hall_val = col_d2.text_input("会場", value=det_current['hall'], key=f"detail_hall_{ver}")
-            
-            col_d3, col_d4, col_d5, col_d6 = st.columns(4)
-            open_val = col_d3.text_input("開場時刻 (例: 10:00)", value=det_current['open'], key=f"detail_open_{ver}")
-            start_val = col_d4.text_input("審査開始 (例: 11:00)", value=det_current['start'], key=f"detail_start_{ver}")
-            end_val = col_d5.text_input("審査終了 (例: 14:00)", value=det_current['end'], key=f"detail_end_{ver}")
-            reception_val = col_d6.text_input("受付時間 (例: 10:45-15:30)", value=det_current['reception'], key=f"detail_reception_{ver}")
-
-            col_d7, col_d8 = st.columns(2)
-            result_val = col_d7.text_input("結果発表日時 (自動計算)", value=det_current['result'], key=f"detail_result_{ver}")
-            
-            method_options = ["公式サイト上で掲載", "会場ロビーもしくはホワイエで掲載", "表彰式にて発表", "その他"]
-            curr_method = det_current.get('method', "公式サイト上で掲載")
-            idx_method = method_options.index(curr_method) if curr_method in method_options else 0
-            method_val = col_d8.selectbox("結果発表方式", method_options, index=idx_method, key=f"detail_method_{ver}")
-
-            # 最新の入力値を保存用辞書に格納
-            det_updated = {
-                'date': date_val, 'hall': hall_val, 
-                'open': open_val, 'start': start_val, 'end': end_val, 
-                'reception': reception_val, 'result': result_val, 'method': method_val
-            }
-            st.session_state['contest_details'] = det_updated
-
-            # --- 6. ファイル出力 ---
-            st.header("6. ファイル出力")
-            if st.button("ファイル生成を実行", type="primary", key=f"btn_gen_{ver}"):
-                # バリデーション
-                assigned_nos = []
-                for grp in st.session_state['groups']:
-                    members = resolve_participants_from_string(grp['member_input'], all_data)
-                    for m in members:
-                        assigned_nos.append(m['no'])
-                
-                counts = Counter(assigned_nos)
-                duplicates = [no for no, count in counts.items() if count > 1]
-                
-                if duplicates:
-                    st.error(f"⛔ エラー: 以下の出場番号が複数のグループに重複して登録されています。\n{', '.join(duplicates)}")
-                    return 
-                
-                all_nos_set = set(item['no'] for item in all_data)
-                assigned_nos_set = set(assigned_nos)
-                unregistered = sorted(list(all_nos_set - assigned_nos_set))
-                
-                if unregistered:
-                    st.warning(f"⚠️ 注意: 以下の出場番号はどのグループにも登録されていません。\n{', '.join(unregistered)}")
-
-                if not score_template_path:
-                    st.error("採点表テンプレートが選択されていません。")
-                    return
-                if not web_template_path:
-                    st.warning("WEBプログラムテンプレートが選択されていません。")
-                if not judges_list_template_path:
-                    st.warning("審査員リストテンプレートが選択されていません。")
-
-                valid_judges = [j for j in st.session_state['judges'] if j.strip()]
-                
-                details_formatted = {
-                    'contest_date': det_updated['date'],
-                    'contest_hall': det_updated['hall'],
-                    'contest_open': format_single_time_label(det_updated['open']),
-                    'contest_reception': format_time_label(det_updated['reception']),
-                    'contest_start': format_single_time_label(det_updated['start']),
-                    'contest_end': format_single_time_label(det_updated['end']),
-                    'contest_result': det_updated['result'],
-                    'contest_method': det_updated['method']
-                }
-
-                # Config JSON作成
-                config_json = json.dumps({
-                    'groups': st.session_state['groups'],
-                    'judges': valid_judges,
-                    'contest_name': contest_name,
-                    'contest_details': det_updated,
-                    'excel_config': excel_config_to_save
-                }, ensure_ascii=False, indent=2)
-
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    
-                    base_context = {
-                        'contest_name': contest_name,
-                        **details_formatted
-                    }
-
-                    # 生成処理
-                    for judge in valid_judges:
-                        try:
-                            if hasattr(score_template_path, 'seek'): score_template_path.seek(0)
-                            context = base_context.copy()
-                            context['judge_name'] = judge
-                            doc_io = generate_word_from_template(score_template_path, st.session_state['groups'], all_data, context)
-                            zf.writestr(f"採点表_{judge}.docx", doc_io.getvalue())
-                        except Exception as e:
-                            st.error(f"採点表生成エラー ({judge}): {e}")
-
-                    if reception_template_path:
-                        try:
-                            if hasattr(reception_template_path, 'seek'): reception_template_path.seek(0)
-                            context = base_context.copy()
-                            context['judge_name'] = '受付用'
-                            doc_io = generate_word_from_template(reception_template_path, st.session_state['groups'], all_data, context)
-                            zf.writestr("受付表.docx", doc_io.getvalue())
-                        except Exception as e:
-                            st.error(f"受付表生成エラー: {e}")
-
-                    if web_template_path:
-                        try:
-                            if hasattr(web_template_path, 'seek'): web_template_path.seek(0)
-                            context = base_context.copy()
-                            context['judge_name'] = ''
-                            doc_io = generate_web_program_doc(web_template_path, st.session_state['groups'], all_data, context)
-                            zf.writestr("WEBプログラム.docx", doc_io.getvalue())
-                        except Exception as e:
-                            st.error(f"WEBプログラム生成エラー: {e}")
-                            
-                    if judges_list_template_path:
-                         try:
-                            if hasattr(judges_list_template_path, 'seek'): judges_list_template_path.seek(0)
-                            context = base_context.copy()
-                            doc_io = generate_judges_list_doc(judges_list_template_path, valid_judges, context)
-                            zf.writestr("本日の審査員.docx", doc_io.getvalue())
-                         except Exception as e:
-                            st.error(f"審査員リスト生成エラー: {e}")
-
-                    if os.path.exists(TEMPLATE_DIR):
-                        pdf_files = [f for f in os.listdir(TEMPLATE_DIR) if f.endswith(".pdf")]
-                        for pdf_file in pdf_files:
-                            pdf_path = os.path.join(TEMPLATE_DIR, pdf_file)
-                            zf.write(pdf_path, arcname=pdf_file)
-
-                    zf.writestr("設定データ.json", config_json)
-                
-                st.session_state['zip_buffer'] = zip_buffer
-                st.success("生成完了！下のボタンからダウンロードしてください。")
-            
-            if 'zip_buffer' in st.session_state and st.session_state['zip_buffer']:
-                st.download_button(
-                    label="ZIPファイルをダウンロード",
-                    data=st.session_state['zip_buffer'].getvalue(),
-                    file_name=f"{contest_name}.zip",
-                    mime="application/zip",
-                    on_click=send_email_callback,
-                    key=f"dl_btn_{ver}"
-                )
-
-        except Exception as e:
-            st.error(f"エラーが発生しました: {e}")
+            zf.writestr("設定データ.json", config_json)
+        
+        st.session_state['zip_buffer'] = zip_buffer
+        st.success("生成完了！")
+    
+    if 'zip_buffer' in st.session_state and st.session_state['zip_buffer']:
+        st.download_button(
+            label="ZIPファイルをダウンロード",
+            data=st.session_state['zip_buffer'].getvalue(),
+            file_name=f"{contest_name}.zip",
+            mime="application/zip",
+            on_click=send_email_callback,
+            key=f"dl_btn_{ver}"
+        )
 
 if __name__ == "__main__":
     main()
