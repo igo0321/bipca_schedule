@@ -556,6 +556,8 @@ def main():
     # 初期化
     if 'config_version' not in st.session_state:
         st.session_state['config_version'] = 0
+    if 'last_loaded_json_name' not in st.session_state:
+        st.session_state['last_loaded_json_name'] = None
     if 'groups' not in st.session_state:
         st.session_state['groups'] = [{'member_input': '', 'time_str': '13:00-14:10'}]
     if 'judges' not in st.session_state:
@@ -598,20 +600,48 @@ def main():
     # --- サイドバー: 設定読み込み ---
     with st.sidebar:
         st.header("⚙️ 設定管理")
-        uploaded_config = st.file_uploader("設定ファイル(JSON)を読み込む", type=['json'], key=f"uploader_{ver}")
+        
+        # 修正: アップローダーのKeyは固定する (バージョン番号をつけない)
+        uploaded_config = st.file_uploader(
+            "設定ファイル(JSON)を読み込む", 
+            type=['json'], 
+            key="json_config_uploader_fixed" 
+        )
+
+        # 読み込みロジックの修正: 
+        # ファイルが存在し、かつ「前回読み込んだファイルと違う」場合のみ実行
         if uploaded_config:
-            try:
-                uploaded_config.seek(0)
-                config_data = json.load(uploaded_config)
-                load_settings_from_json(config_data)
-                st.success("設定を復元しました（画面が更新されます）")
-                st.rerun()
-            except Exception as e:
-                st.error(f"設定読み込みエラー: {e}")
+            if uploaded_config.name != st.session_state['last_loaded_json_name']:
+                try:
+                    uploaded_config.seek(0)
+                    config_data = json.load(uploaded_config)
+                    
+                    # 設定ロード & バージョンアップ
+                    load_settings_from_json(config_data)
+                    
+                    # 読み込み済みフラグ更新
+                    st.session_state['last_loaded_json_name'] = uploaded_config.name
+                    
+                    st.success("設定を読み込みました。画面を更新します...")
+                    st.rerun() # リロードして画面反映
+                except Exception as e:
+                    st.error(f"設定読み込みエラー: {e}")
+            else:
+                # 既に読み込み済みの場合は何もしない（画面保持）
+                pass
+        else:
+            # ファイルが削除された場合、フラグをリセット
+            st.session_state['last_loaded_json_name'] = None
 
     # --- 1. 名簿データ (Excel) ---
     st.header("1. 名簿データ (Excel)")
-    uploaded_excel = st.file_uploader("名簿Excelファイルをアップロード", type=['xlsx', 'xls', 'csv'], key=f"excel_up_{ver}")
+    
+    # Excelアップローダーも同様にKeyを固定する方が安全（リロード時に消えないように）
+    uploaded_excel = st.file_uploader(
+        "名簿Excelファイルをアップロード", 
+        type=['xlsx', 'xls', 'csv'], 
+        key="excel_uploader_fixed"
+    )
     
     all_data = []
     excel_config_to_save = {}
@@ -637,6 +667,7 @@ def main():
                 if saved_sheet and saved_sheet in sheet_names:
                     default_sheet_idx = sheet_names.index(saved_sheet)
                 
+                # セレクトボックスはバージョン依存で再生成させる (設定反映のため)
                 selected_sheet = st.selectbox("シートを選択", sheet_names, index=default_sheet_idx, key=f"sheet_sel_{ver}")
                 df = pd.read_excel(uploaded_excel, sheet_name=selected_sheet)
 
@@ -661,6 +692,7 @@ def main():
 
             c1, c2, c3, c4 = st.columns(4)
             
+            # 各セレクトボックスは {ver} をキーに含めることで、JSONロード時に初期選択位置を再計算させる
             idx_no = get_col_index('col_no', ["出場番号", "No", "No."], cols, 0)
             col_no = c1.selectbox("出場番号", cols, index=idx_no, key=f"c_no_{ver}")
 
