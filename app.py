@@ -886,7 +886,7 @@ def main():
 
     col_d7, col_d8 = st.columns(2)
     result_val = col_d7.text_input("結果発表日時", value=det_current['result'], key=f"detail_result_{st.session_state['config_version']}")
-    method_options = ["公式サイト上で掲載", "会場ロビーもしくはホワイエで掲載", "表彰式にて発表", "その他"]
+    method_options = ["公式サイト上で掲載", "会場ロビーもしくはホワイエで掲示", "表彰式にて発表", "その他"]
     curr_method = det_current.get('method', "公式サイト上で掲載")
     idx_method = method_options.index(curr_method) if curr_method in method_options else 0
     method_val = col_d8.selectbox("結果発表方式", method_options, index=idx_method, key=f"detail_method_{st.session_state['config_version']}")
@@ -990,3 +990,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
