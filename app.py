@@ -581,7 +581,7 @@ def main():
 
     if not st.session_state['user_email']:
         st.title("🎹 コンクール運営資料ジェネレーター")
-        st.info("使用履歴を確認するため、メールアドレスの入力をお願いします。")
+        st.info("メールアドレスの入力をお願いします。")
         
         with st.form("email_login_form"):
             input_email = st.text_input("ご担当者様 メールアドレス", placeholder="example@example.com")
@@ -598,12 +598,8 @@ def main():
     # --- 以下、メインコンテンツ ---
     st.title("🎹 コンクール運営資料ジェネレーター (Word版)")
     st.markdown(f"**ログイン中:** {st.session_state['user_email']}")
-    
-    # NOTE: ここで `ver = st.session_state['config_version']` とローカル変数に入れてしまうと、
-    # JSON読み込み後に更新されたバージョンが反映されず、WidgetのKeyが古いままになるバグの原因となる。
-    # したがって、WidgetのKey指定では必ず `st.session_state['config_version']` を直接参照する。
 
-    # --- Step 1. 名簿データ (Excel) - 必須 ---
+    # --- Step 1. 名簿データ (Excel) - アップロードのみ ---
     st.header("Step 1. 名簿データ (Excel) をアップロード")
     st.info("まずはExcelファイルをアップロードしてください。設定メニューはその後表示されます。")
     
@@ -616,41 +612,8 @@ def main():
     if not uploaded_excel:
         st.stop() # Excelがないとここで止まる（下のUIが出ない）
 
-    # --- Excel読み込み処理 ---
-    all_data = []
-    excel_config_to_save = {}
-    
-    try:
-        # シート選択など
-        saved_config = st.session_state.get('saved_excel_config', {})
-        saved_sheet = saved_config.get('sheet_name') if saved_config else None
-        
-        df = None
-        selected_sheet = None
-        
-        if uploaded_excel.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_excel)
-            selected_sheet = "CSV"
-        else:
-            xls = pd.ExcelFile(uploaded_excel)
-            sheet_names = xls.sheet_names
-            
-            default_sheet_idx = 0
-            if saved_sheet and saved_sheet in sheet_names:
-                default_sheet_idx = sheet_names.index(saved_sheet)
-            
-            # Keyをダイナミックにする
-            selected_sheet = st.selectbox("シートを選択", sheet_names, index=default_sheet_idx, key=f"sheet_sel_{st.session_state['config_version']}")
-            df = pd.read_excel(uploaded_excel, sheet_name=selected_sheet)
-
-        excel_config_to_save['sheet_name'] = selected_sheet
-        cols = df.columns.tolist()
-
-    except Exception as e:
-        st.error(f"Excel読み込みエラー: {e}")
-        st.stop()
-
     # --- Step 2. 設定JSONの読み込み (任意) ---
+    # Excel読み込みロジック(Step 3)の前にJSON読み込みを配置することで、シート名設定を反映可能にする
     st.header("Step 2. 過去の設定を読み込む (任意)")
     st.markdown("以前保存した `設定データ.json` がある場合はここで読み込んでください。")
 
@@ -665,28 +628,66 @@ def main():
             try:
                 content = uploaded_config.getvalue().decode("utf-8")
                 config_data = json.loads(content)
-                # ここでバージョン番号がインクリメントされる
+                # ここでバージョン番号がインクリメントされ、saved_excel_config 等が更新される
                 load_settings_from_json(config_data)
                 
                 st.session_state['last_loaded_json_name'] = uploaded_config.name
                 st.success("設定を読み込みました。下の入力欄が自動更新されます。")
-                # ここではrerunせず、このまま下の処理へ進むことで、新しいバージョン番号でWidgetが生成される
             except Exception as e:
                 st.error(f"設定読み込みエラー: {e}")
     else:
         st.session_state['last_loaded_json_name'] = None
 
     # --- デフォルト値生成ロジック ---
-    # JSON読み込みフェーズが終わってもリストが空の場合のみ、デフォルト値を作成
     if not st.session_state['groups']:
         st.session_state['groups'] = [{'member_input': '', 'time_str': '13:00-14:10'}]
     if not st.session_state['judges']:
         st.session_state['judges'] = ["審査員A"]
 
-    # --- Step 3. 各種詳細設定 ---
+    # --- Step 3. 詳細設定と出力 ---
+    # ここで初めて Excelデータを読み込み、JSONで指定されたシート名(あれば)を使って初期化する
     st.header("Step 3. 詳細設定と出力")
+    
+    # 3-0. Excel読み込み & シート選択
+    st.subheader("3-0. シート選択")
+    all_data = []
+    excel_config_to_save = {}
+    cols = []
+    df = None
+    
+    try:
+        saved_config = st.session_state.get('saved_excel_config', {})
+        saved_sheet = saved_config.get('sheet_name') if saved_config else None
+        
+        selected_sheet = None
+        
+        # ファイルポインタを先頭に戻しておく（念のため）
+        uploaded_excel.seek(0)
 
-    # 列の割り当て
+        if uploaded_excel.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_excel)
+            selected_sheet = "CSV"
+        else:
+            xls = pd.ExcelFile(uploaded_excel)
+            sheet_names = xls.sheet_names
+            
+            # JSONから読み込んだシート名があればそれを、なければ0番目を選択
+            default_sheet_idx = 0
+            if saved_sheet and saved_sheet in sheet_names:
+                default_sheet_idx = sheet_names.index(saved_sheet)
+            
+            # シート選択（JSON読込後に描画されるので、saved_sheet が反映される）
+            selected_sheet = st.selectbox("シートを選択", sheet_names, index=default_sheet_idx, key=f"sheet_sel_{st.session_state['config_version']}")
+            df = pd.read_excel(uploaded_excel, sheet_name=selected_sheet)
+
+        excel_config_to_save['sheet_name'] = selected_sheet
+        cols = df.columns.tolist()
+
+    except Exception as e:
+        st.error(f"Excel読み込みエラー: {e}")
+        st.stop()
+
+    # 3-1. 列の割り当て
     st.subheader("3-1. 列の割り当て")
     def get_col_index(saved_key, default_heuristic_cols, all_cols, fallback_index=0):
         if saved_config and saved_key in saved_config:
@@ -696,7 +697,6 @@ def main():
             if h in all_cols: return all_cols.index(h)
         return fallback_index
 
-    # 各WidgetのKeyに st.session_state['config_version'] を埋め込む
     c1, c2, c3, c4 = st.columns(4)
     idx_no = get_col_index('col_no', ["出場番号", "No", "No."], cols, 0)
     col_no = c1.selectbox("出場番号", cols, index=idx_no, key=f"c_no_{st.session_state['config_version']}")
