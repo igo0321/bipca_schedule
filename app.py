@@ -606,6 +606,7 @@ def main():
         st.session_state['user_email'] = None
 
     if not st.session_state['user_email']:
+        # ★修正: ここで st.stop() を使わず、未ログイン時のみ表示する画面を描画して終了する
         st.title("🎹 コンクール運営資料ジェネレーター")
         st.info("使用履歴を確認するため、メールアドレスの入力をお願いします。")
         
@@ -619,6 +620,7 @@ def main():
                     st.rerun()
                 else:
                     st.error("有効なメールアドレスを入力してください。")
+        # ここで return することで、以降のメイン処理には進まない
         return
 
     # -----------------------------------------------------
@@ -687,8 +689,11 @@ def main():
                 # シート選択はCSVには不要だが、変数互換のためにダミーを設定
                 xls = None 
             else:
-                # 修正: pd.ExcelFile オブジェクトを作成して再利用する
-                xls = pd.ExcelFile(uploaded_excel)
+                # 修正: メモリバッファを使用して読み込む
+                # これにより、Pandasがストリームを閉じても、元のuploaded_excelは影響を受けない
+                excel_data = io.BytesIO(uploaded_excel.getvalue())
+                xls = pd.ExcelFile(excel_data)
+                
                 if 'excel_sheet_name' in st.session_state and st.session_state['excel_sheet_name'] not in xls.sheet_names:
                     del st.session_state['excel_sheet_name']
                 
@@ -1093,3 +1098,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+}
