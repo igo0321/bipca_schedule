@@ -556,15 +556,15 @@ def load_settings_from_json(json_data):
 def main():
     st.set_page_config(layout="wide", page_title="コンクール資料作成")
     
-    # 初期化 (修正: デフォルトで空リストにしておく)
+    # 初期化
     if 'config_version' not in st.session_state:
         st.session_state['config_version'] = 0
     if 'last_loaded_json_name' not in st.session_state:
         st.session_state['last_loaded_json_name'] = None
     if 'groups' not in st.session_state:
-        st.session_state['groups'] = [] # ここ重要！ 最初は空。デフォルト値はいれない。
+        st.session_state['groups'] = [] # 最初は空。
     if 'judges' not in st.session_state:
-        st.session_state['judges'] = [] # ここ重要！ 最初は空。
+        st.session_state['judges'] = [] # 最初は空。
     if 'saved_excel_config' not in st.session_state:
         st.session_state['saved_excel_config'] = None
     if 'contest_details' not in st.session_state:
@@ -599,7 +599,9 @@ def main():
     st.title("🎹 コンクール運営資料ジェネレーター (Word版)")
     st.markdown(f"**ログイン中:** {st.session_state['user_email']}")
     
-    ver = st.session_state['config_version']
+    # NOTE: ここで `ver = st.session_state['config_version']` とローカル変数に入れてしまうと、
+    # JSON読み込み後に更新されたバージョンが反映されず、WidgetのKeyが古いままになるバグの原因となる。
+    # したがって、WidgetのKey指定では必ず `st.session_state['config_version']` を直接参照する。
 
     # --- Step 1. 名簿データ (Excel) - 必須 ---
     st.header("Step 1. 名簿データ (Excel) をアップロード")
@@ -633,13 +635,12 @@ def main():
             xls = pd.ExcelFile(uploaded_excel)
             sheet_names = xls.sheet_names
             
-            # デフォルトインデックスの決定
             default_sheet_idx = 0
             if saved_sheet and saved_sheet in sheet_names:
                 default_sheet_idx = sheet_names.index(saved_sheet)
             
-            # Excel設定後、シート選択
-            selected_sheet = st.selectbox("シートを選択", sheet_names, index=default_sheet_idx, key=f"sheet_sel_{ver}")
+            # Keyをダイナミックにする
+            selected_sheet = st.selectbox("シートを選択", sheet_names, index=default_sheet_idx, key=f"sheet_sel_{st.session_state['config_version']}")
             df = pd.read_excel(uploaded_excel, sheet_name=selected_sheet)
 
         excel_config_to_save['sheet_name'] = selected_sheet
@@ -664,17 +665,19 @@ def main():
             try:
                 content = uploaded_config.getvalue().decode("utf-8")
                 config_data = json.loads(content)
+                # ここでバージョン番号がインクリメントされる
                 load_settings_from_json(config_data)
+                
                 st.session_state['last_loaded_json_name'] = uploaded_config.name
-                st.success("設定を読み込みました。")
+                st.success("設定を読み込みました。下の入力欄が自動更新されます。")
+                # ここではrerunせず、このまま下の処理へ進むことで、新しいバージョン番号でWidgetが生成される
             except Exception as e:
                 st.error(f"設定読み込みエラー: {e}")
     else:
         st.session_state['last_loaded_json_name'] = None
 
-    # --- ★重要: デフォルト値生成ロジック ---
-    # JSON読み込みフェーズが終わっても、まだリストが空の場合（＝JSONなし、初回起動時）
-    # ここで初めてデフォルト値をセットする。これで「JSONがあるのにデフォルト値で上書き」を防げる。
+    # --- デフォルト値生成ロジック ---
+    # JSON読み込みフェーズが終わってもリストが空の場合のみ、デフォルト値を作成
     if not st.session_state['groups']:
         st.session_state['groups'] = [{'member_input': '', 'time_str': '13:00-14:10'}]
     if not st.session_state['judges']:
@@ -693,12 +696,13 @@ def main():
             if h in all_cols: return all_cols.index(h)
         return fallback_index
 
+    # 各WidgetのKeyに st.session_state['config_version'] を埋め込む
     c1, c2, c3, c4 = st.columns(4)
     idx_no = get_col_index('col_no', ["出場番号", "No", "No."], cols, 0)
-    col_no = c1.selectbox("出場番号", cols, index=idx_no, key=f"c_no_{ver}")
+    col_no = c1.selectbox("出場番号", cols, index=idx_no, key=f"c_no_{st.session_state['config_version']}")
 
     idx_name = get_col_index('col_name', ["氏名", "名前"], cols, 0)
-    col_name = c2.selectbox("氏名", cols, index=idx_name, key=f"c_name_{ver}")
+    col_name = c2.selectbox("氏名", cols, index=idx_name, key=f"c_name_{st.session_state['config_version']}")
     
     kana_options = ["(なし)"] + cols
     idx_kana = 0
@@ -706,10 +710,10 @@ def main():
         if saved_config['col_kana'] in kana_options: idx_kana = kana_options.index(saved_config['col_kana'])
     elif "フリガナ" in cols:
         idx_kana = cols.index("フリガナ") + 1
-    col_kana = c3.selectbox("フリガナ (任意)", kana_options, index=idx_kana, key=f"c_kana_{ver}")
+    col_kana = c3.selectbox("フリガナ (任意)", kana_options, index=idx_kana, key=f"c_kana_{st.session_state['config_version']}")
     
     idx_song = get_col_index('col_song', ["演奏曲目", "曲目"], cols, 0)
-    col_song = c4.selectbox("演奏曲目", cols, index=idx_song, key=f"c_song_{ver}")
+    col_song = c4.selectbox("演奏曲目", cols, index=idx_song, key=f"c_song_{st.session_state['config_version']}")
     
     c5, c6, c7 = st.columns(3)
     age_options = ["(なし)"] + cols
@@ -718,7 +722,7 @@ def main():
             if saved_config['col_age'] in age_options: idx_age = age_options.index(saved_config['col_age'])
     elif "年齢" in cols:
             idx_age = cols.index("年齢") + 1
-    col_age = c5.selectbox("年齢列 (任意)", age_options, index=idx_age, key=f"c_age_{ver}")
+    col_age = c5.selectbox("年齢列 (任意)", age_options, index=idx_age, key=f"c_age_{st.session_state['config_version']}")
 
     tel_options = ["(なし)"] + cols
     idx_tel = 0
@@ -726,7 +730,7 @@ def main():
             if saved_config['col_tel'] in tel_options: idx_tel = tel_options.index(saved_config['col_tel'])
     elif "電話番号" in cols:
             idx_tel = cols.index("電話番号") + 1
-    col_tel = c6.selectbox("電話番号列 (受付表用)", tel_options, index=idx_tel, key=f"c_tel_{ver}")
+    col_tel = c6.selectbox("電話番号列 (受付表用)", tel_options, index=idx_tel, key=f"c_tel_{st.session_state['config_version']}")
 
     dur_options = ["(なし)"] + cols
     idx_dur = 0
@@ -734,7 +738,7 @@ def main():
             if saved_config['col_duration'] in dur_options: idx_dur = dur_options.index(saved_config['col_duration'])
     elif "演奏時間" in cols:
             idx_dur = cols.index("演奏時間") + 1
-    col_duration = c7.selectbox("演奏時間列 (自動計算用)", dur_options, index=idx_dur, key=f"c_dur_{ver}")
+    col_duration = c7.selectbox("演奏時間列 (自動計算用)", dur_options, index=idx_dur, key=f"c_dur_{st.session_state['config_version']}")
 
     excel_config_to_save.update({
         'col_no': col_no, 'col_name': col_name, 'col_kana': col_kana,
@@ -784,19 +788,19 @@ def main():
         col_t1, col_t2 = st.columns(2)
         col_t3, col_t4 = st.columns(2)
         with col_t1:
-            selected_score_file = st.selectbox("採点表テンプレート", template_files, index=idx_score, key=f"tpl_sc_{ver}")
+            selected_score_file = st.selectbox("採点表テンプレート", template_files, index=idx_score, key=f"tpl_sc_{st.session_state['config_version']}")
             score_template_path = os.path.join(TEMPLATE_DIR, selected_score_file)
         with col_t2:
-            selected_reception_file = st.selectbox("受付表テンプレート", template_files, index=idx_reception, key=f"tpl_rc_{ver}")
+            selected_reception_file = st.selectbox("受付表テンプレート", template_files, index=idx_reception, key=f"tpl_rc_{st.session_state['config_version']}")
             reception_template_path = os.path.join(TEMPLATE_DIR, selected_reception_file)
         with col_t3:
-            selected_web_file = st.selectbox("WEBプログラムテンプレート", template_files, index=idx_web, key=f"tpl_wb_{ver}")
+            selected_web_file = st.selectbox("WEBプログラムテンプレート", template_files, index=idx_web, key=f"tpl_wb_{st.session_state['config_version']}")
             web_template_path = os.path.join(TEMPLATE_DIR, selected_web_file)
         with col_t4:
-            selected_judges_file = st.selectbox("審査員リストテンプレート", template_files, index=idx_judges, key=f"tpl_jd_{ver}")
+            selected_judges_file = st.selectbox("審査員リストテンプレート", template_files, index=idx_judges, key=f"tpl_jd_{st.session_state['config_version']}")
             judges_list_template_path = os.path.join(TEMPLATE_DIR, selected_judges_file)
         
-        if st.checkbox("テンプレートを手動でアップロードする", key=f"chk_manual_{ver}"):
+        if st.checkbox("テンプレートを手動でアップロードする", key=f"chk_manual_{st.session_state['config_version']}"):
             use_manual_upload = True
     else:
         st.warning("templatesフォルダが見つからないため、手動アップロードモードになります。")
@@ -804,10 +808,10 @@ def main():
 
     if use_manual_upload:
         c_up1, c_up2 = st.columns(2); c_up3, c_up4 = st.columns(2)
-        uploaded_score_template = c_up1.file_uploader("採点表テンプレート (.docx)", type=['docx'], key=f"up_sc_{ver}")
-        uploaded_reception_template = c_up2.file_uploader("受付表テンプレート (.docx)", type=['docx'], key=f"up_rc_{ver}")
-        uploaded_web_template = c_up3.file_uploader("WEBプログラムテンプレート (.docx)", type=['docx'], key=f"up_wb_{ver}")
-        uploaded_judges_template = c_up4.file_uploader("審査員リストテンプレート (.docx)", type=['docx'], key=f"up_jd_{ver}")
+        uploaded_score_template = c_up1.file_uploader("採点表テンプレート (.docx)", type=['docx'], key=f"up_sc_{st.session_state['config_version']}")
+        uploaded_reception_template = c_up2.file_uploader("受付表テンプレート (.docx)", type=['docx'], key=f"up_rc_{st.session_state['config_version']}")
+        uploaded_web_template = c_up3.file_uploader("WEBプログラムテンプレート (.docx)", type=['docx'], key=f"up_wb_{st.session_state['config_version']}")
+        uploaded_judges_template = c_up4.file_uploader("審査員リストテンプレート (.docx)", type=['docx'], key=f"up_jd_{st.session_state['config_version']}")
         
         if uploaded_score_template: score_template_path = uploaded_score_template
         if uploaded_reception_template: reception_template_path = uploaded_reception_template
@@ -825,15 +829,15 @@ def main():
         if idx < len(st.session_state['groups']) - 1: st.session_state['groups'][idx], st.session_state['groups'][idx+1] = st.session_state['groups'][idx+1], st.session_state['groups'][idx]
     def remove_group(idx): st.session_state['groups'].pop(idx)
 
-    st.button("＋ グループ追加", on_click=add_group, key=f"btn_add_grp_{ver}")
+    st.button("＋ グループ追加", on_click=add_group, key=f"btn_add_grp_{st.session_state['config_version']}")
 
     for i, grp in enumerate(st.session_state['groups']):
         c_sort, c_input, c_total, c_time, c_del = st.columns([0.8, 3, 1.2, 2, 0.5])
         with c_sort:
-            if st.button("▲", key=f"up_{i}_{ver}"): move_group_up(i); st.rerun()
-            if st.button("▼", key=f"down_{i}_{ver}"): move_group_down(i); st.rerun()
+            if st.button("▲", key=f"up_{i}_{st.session_state['config_version']}"): move_group_up(i); st.rerun()
+            if st.button("▼", key=f"down_{i}_{st.session_state['config_version']}"): move_group_down(i); st.rerun()
 
-        input_val = c_input.text_input(f"グループ {i+1} 対象番号", value=grp['member_input'], key=f"g_in_{i}_{ver}", placeholder="例: A01-A05, C01")
+        input_val = c_input.text_input(f"グループ {i+1} 対象番号", value=grp['member_input'], key=f"g_in_{i}_{st.session_state['config_version']}", placeholder="例: A01-A05, C01")
         st.session_state['groups'][i]['member_input'] = input_val
         
         current_members = resolve_participants_from_string(input_val, all_data)
@@ -842,23 +846,23 @@ def main():
         with c_total:
              st.markdown(f"<div style='margin-top: 1.8rem; font-weight:bold; color: #004280;'>計: {format_seconds_to_jp_label(total_sec)}</div>", unsafe_allow_html=True)
 
-        time_val = c_time.text_input("時間", value=grp['time_str'], key=f"g_time_{i}_{ver}", placeholder="例: 13:00-14:00")
+        time_val = c_time.text_input("時間", value=grp['time_str'], key=f"g_time_{i}_{st.session_state['config_version']}", placeholder="例: 13:00-14:00")
         st.session_state['groups'][i]['time_str'] = time_val
 
         with c_del:
             st.markdown("<div style='margin-top: 1.8rem;'></div>", unsafe_allow_html=True)
-            if st.button("×", key=f"del_{i}_{ver}"): remove_group(i); st.rerun()
+            if st.button("×", key=f"del_{i}_{st.session_state['config_version']}"): remove_group(i); st.rerun()
 
     # 審査員設定
     st.subheader("3-4. 審査員設定")
     def add_judge(): st.session_state['judges'].append("")
-    st.button("＋ 審査員追加", on_click=add_judge, key=f"btn_add_jdg_{ver}")
+    st.button("＋ 審査員追加", on_click=add_judge, key=f"btn_add_jdg_{st.session_state['config_version']}")
     
     for i in range(len(st.session_state['judges'])):
-        val = st.text_input(f"審査員 {i+1}", value=st.session_state['judges'][i], key=f"judge_input_{i}_{ver}")
+        val = st.text_input(f"審査員 {i+1}", value=st.session_state['judges'][i], key=f"judge_input_{i}_{st.session_state['config_version']}")
         st.session_state['judges'][i] = val
 
-    contest_name = st.text_input("コンクール名 (ファイル名等に使用)", value=st.session_state['contest_name'], key=f"input_contest_name_{ver}")
+    contest_name = st.text_input("コンクール名 (ファイル名等に使用)", value=st.session_state['contest_name'], key=f"input_contest_name_{st.session_state['config_version']}")
     st.session_state['contest_name'] = contest_name
 
     # 審査会詳細
@@ -871,21 +875,21 @@ def main():
         if calculated: st.session_state['contest_details']['result'] = calculated
 
     col_d1, col_d2 = st.columns(2)
-    date_val = col_d1.text_input("開催日時 (例: 2025年12月21日)", value=det_current['date'], key=f"detail_date_{ver}", on_change=on_date_change)
-    hall_val = col_d2.text_input("会場", value=det_current['hall'], key=f"detail_hall_{ver}")
+    date_val = col_d1.text_input("開催日時 (例: 2025年12月21日)", value=det_current['date'], key=f"detail_date_{st.session_state['config_version']}", on_change=on_date_change)
+    hall_val = col_d2.text_input("会場", value=det_current['hall'], key=f"detail_hall_{st.session_state['config_version']}")
     
     col_d3, col_d4, col_d5, col_d6 = st.columns(4)
-    open_val = col_d3.text_input("開場時刻", value=det_current['open'], key=f"detail_open_{ver}")
-    start_val = col_d4.text_input("審査開始", value=det_current['start'], key=f"detail_start_{ver}")
-    end_val = col_d5.text_input("審査終了", value=det_current['end'], key=f"detail_end_{ver}")
-    reception_val = col_d6.text_input("受付時間", value=det_current['reception'], key=f"detail_reception_{ver}")
+    open_val = col_d3.text_input("開場時刻", value=det_current['open'], key=f"detail_open_{st.session_state['config_version']}")
+    start_val = col_d4.text_input("審査開始", value=det_current['start'], key=f"detail_start_{st.session_state['config_version']}")
+    end_val = col_d5.text_input("審査終了", value=det_current['end'], key=f"detail_end_{st.session_state['config_version']}")
+    reception_val = col_d6.text_input("受付時間", value=det_current['reception'], key=f"detail_reception_{st.session_state['config_version']}")
 
     col_d7, col_d8 = st.columns(2)
-    result_val = col_d7.text_input("結果発表日時", value=det_current['result'], key=f"detail_result_{ver}")
+    result_val = col_d7.text_input("結果発表日時", value=det_current['result'], key=f"detail_result_{st.session_state['config_version']}")
     method_options = ["公式サイト上で掲載", "会場ロビーもしくはホワイエで掲載", "表彰式にて発表", "その他"]
     curr_method = det_current.get('method', "公式サイト上で掲載")
     idx_method = method_options.index(curr_method) if curr_method in method_options else 0
-    method_val = col_d8.selectbox("結果発表方式", method_options, index=idx_method, key=f"detail_method_{ver}")
+    method_val = col_d8.selectbox("結果発表方式", method_options, index=idx_method, key=f"detail_method_{st.session_state['config_version']}")
 
     det_updated = {
         'date': date_val, 'hall': hall_val, 'open': open_val, 
@@ -896,7 +900,7 @@ def main():
 
     # --- ファイル出力 ---
     st.header("Step 4. ファイル生成")
-    if st.button("ファイル生成を実行", type="primary", key=f"btn_gen_{ver}"):
+    if st.button("ファイル生成を実行", type="primary", key=f"btn_gen_{st.session_state['config_version']}"):
         # バリデーション
         assigned_nos = []
         for grp in st.session_state['groups']:
@@ -981,7 +985,7 @@ def main():
             file_name=f"{contest_name}.zip",
             mime="application/zip",
             on_click=send_email_callback,
-            key=f"dl_btn_{ver}"
+            key=f"dl_btn_{st.session_state['config_version']}"
         )
 
 if __name__ == "__main__":
