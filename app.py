@@ -631,33 +631,38 @@ def main():
     with st.sidebar:
         st.header("⚙️ 設定管理")
         uploaded_config = st.file_uploader("設定ファイル(JSON)を読み込む", type=['json'])
-        if uploaded_config:
-            uploaded_config.seek(0)
-            config_data = json.load(uploaded_config)
-            
-            # 1. セッションステートの更新
-            st.session_state.update(config_data)
-            
-            # 2. 【重要】古いウィジェット状態(Key)の削除
-            # これをやらないと、Streamlitは古い入力値を保持し続け、JSONの値が反映されない
-            keys_to_clear = []
-            for k in st.session_state.keys():
-                if k.startswith('judge_input_') or k.startswith('g_in_') or k.startswith('g_time_'):
-                    keys_to_clear.append(k)
-            
-            for k in keys_to_clear:
-                del st.session_state[k]
-            
-            # 3. コンクール名や日付など、個別のKeyへの値セット
-            if 'contest_name' in config_data:
-                st.session_state['contest_name_key'] = config_data['contest_name']
-            
-            if 'contest_details' in config_data:
-                 if 'date' in config_data['contest_details']:
-                     st.session_state['detail_date'] = config_data['contest_details']['date']
+        
+        # 修正: ボタンを追加し、押下時のみ読み込みとキャッシュクリアを実行
+        if st.button("設定を反映"):
+            if uploaded_config:
+                try:
+                    uploaded_config.seek(0)
+                    config_data = json.load(uploaded_config)
+                    
+                    # 1. セッションステートの更新
+                    st.session_state.update(config_data)
+                    
+                    # 2. 古いウィジェット状態(Key)の削除 (反映されない問題への対策)
+                    keys_to_clear = []
+                    for k in st.session_state.keys():
+                        if k.startswith('judge_input_') or k.startswith('g_in_') or k.startswith('g_time_'):
+                            keys_to_clear.append(k)
+                    for k in keys_to_clear:
+                        del st.session_state[k]
+                    
+                    # 3. コンクール名や日付など、個別のKeyへの値セット
+                    if 'contest_name' in config_data:
+                        st.session_state['contest_name_key'] = config_data['contest_name']
+                    if 'contest_details' in config_data:
+                         if 'date' in config_data['contest_details']:
+                             st.session_state['detail_date'] = config_data['contest_details']['date']
 
-            st.success("設定を復元しました")
-            st.rerun() # 画面をリロードして反映
+                    st.success("設定を復元しました")
+                    st.rerun() 
+                except Exception as e:
+                    st.error(f"JSON読み込みエラー: {e}")
+            else:
+                st.warning("JSONファイルを選択してください。")
 
     # --- 1. Excelアップロード ---
     st.header("1. 名簿データ (Excel)")
@@ -816,10 +821,9 @@ def main():
                         move_group_down(i)
                         st.rerun()
 
-                # valueをsession_stateから取るようにする
                 input_val = c_input.text_input(
                     f"グループ {i+1} 対象番号",
-                    value=st.session_state['groups'][i]['member_input'],
+                    value=grp['member_input'],
                     key=f"g_in_{i}",
                     placeholder="例: A01-A05, C01"
                 )
@@ -855,7 +859,7 @@ def main():
 
                 time_val = c_time.text_input(
                     "時間",
-                    value=st.session_state['groups'][i]['time_str'],
+                    value=grp['time_str'],
                     key=f"g_time_{i}",
                     placeholder="例: 13:00-14:00"
                 )
@@ -877,17 +881,13 @@ def main():
                 st.rerun()
 
             for i in range(len(st.session_state['judges'])):
-                val = st.text_input(
-                    f"審査員 {i+1}", 
-                    value=st.session_state['judges'][i], 
-                    key=f"judge_input_{i}"
-                )
+                val = st.text_input(f"審査員 {i+1}", value=st.session_state['judges'][i], key=f"judge_input_{i}")
                 st.session_state['judges'][i] = val
 
-            # コンクール名 (Key紐付け & 同期)
-            contest_name_val = st.session_state.get('contest_name', "第10回BIPCA 東京予選④")
-            contest_name = st.text_input("コンクール名 (ファイル名等に使用)", value=contest_name_val, key="contest_name_key")
-            st.session_state['contest_name'] = contest_name 
+            # 修正: コンクール名のキーを指定して反映可能にする
+            contest_name_default = st.session_state.get('contest_name', "第10回BIPCA 東京予選④")
+            contest_name = st.text_input("コンクール名 (ファイル名等に使用)", value=contest_name_default, key="contest_name_key")
+            st.session_state['contest_name'] = contest_name
 
             # --- 5. 審査会詳細 ---
             st.header("5. 審査会詳細")
@@ -930,7 +930,7 @@ def main():
             # --- 6. ファイル出力 ---
             st.header("6. ファイル出力")
             if st.button("ファイル生成を実行", type="primary"):
-                # --- Validation Logic ---
+                # --- NEW: Validation Logic ---
                 
                 # 1. Collect all assigned numbers from groups
                 assigned_nos = []
