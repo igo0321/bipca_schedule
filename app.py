@@ -19,7 +19,7 @@ from docx.text.paragraph import Paragraph
 from docx.shared import Pt
 
 # ---------------------------------------------------------
-# 1. ユーティリティ（時間変換・Word操作・データ解析）
+# 1. ユーティリティ
 # ---------------------------------------------------------
 
 def parse_jp_time_to_seconds(time_str):
@@ -523,7 +523,7 @@ def generate_judges_list_doc(template_path_or_file, judges_list, global_context)
     return output_buffer
 
 # ---------------------------------------------------------
-# 4. 設定ロード用関数（Versioned Keys対応）
+# 4. 設定ロード用関数
 # ---------------------------------------------------------
 
 def load_settings_from_json(json_data):
@@ -532,13 +532,16 @@ def load_settings_from_json(json_data):
     Config Versionをインクリメントすることで、ウィジェットの強制リフレッシュを行う。
     """
     # 1. 基本データ
-    st.session_state['groups'] = json_data.get('groups', [])
-    st.session_state['judges'] = json_data.get('judges', [""])
-    st.session_state['contest_name'] = json_data.get('contest_name', '')
+    if 'groups' in json_data:
+        st.session_state['groups'] = json_data['groups']
+    if 'judges' in json_data:
+        st.session_state['judges'] = json_data['judges']
+    if 'contest_name' in json_data:
+        st.session_state['contest_name'] = json_data['contest_name']
     
     # 2. 詳細設定
-    details = json_data.get('contest_details', {})
-    st.session_state['contest_details'] = details
+    if 'contest_details' in json_data:
+        st.session_state['contest_details'] = json_data['contest_details']
     
     # 3. Excel設定 (後でExcelロード時に使用するため保存)
     if 'excel_config' in json_data:
@@ -601,42 +604,38 @@ def main():
     with st.sidebar:
         st.header("⚙️ 設定管理")
         
-        # 修正: アップローダーのKeyは固定する (バージョン番号をつけない)
+        # キーは固定し、読み込み処理でrerunを使わない方式に変更
         uploaded_config = st.file_uploader(
             "設定ファイル(JSON)を読み込む", 
             type=['json'], 
             key="json_config_uploader_fixed" 
         )
 
-        # 読み込みロジックの修正: 
-        # ファイルが存在し、かつ「前回読み込んだファイルと違う」場合のみ実行
         if uploaded_config:
             if uploaded_config.name != st.session_state['last_loaded_json_name']:
                 try:
-                    uploaded_config.seek(0)
-                    config_data = json.load(uploaded_config)
+                    # 明示的にUTF-8で読み込む
+                    content = uploaded_config.getvalue().decode("utf-8")
+                    config_data = json.loads(content)
                     
                     # 設定ロード & バージョンアップ
                     load_settings_from_json(config_data)
                     
                     # 読み込み済みフラグ更新
                     st.session_state['last_loaded_json_name'] = uploaded_config.name
+                    st.success("設定を読み込みました。")
                     
-                    st.success("設定を読み込みました。画面を更新します...")
-                    st.rerun() # リロードして画面反映
+                    # ここで st.rerun() は呼ばない！
+                    # verが増えたので、この後の処理で自動的に新しいウィジェットが生成され、値が反映される。
+                    
                 except Exception as e:
                     st.error(f"設定読み込みエラー: {e}")
-            else:
-                # 既に読み込み済みの場合は何もしない（画面保持）
-                pass
         else:
-            # ファイルが削除された場合、フラグをリセット
             st.session_state['last_loaded_json_name'] = None
 
     # --- 1. 名簿データ (Excel) ---
     st.header("1. 名簿データ (Excel)")
     
-    # Excelアップローダーも同様にKeyを固定する方が安全（リロード時に消えないように）
     uploaded_excel = st.file_uploader(
         "名簿Excelファイルをアップロード", 
         type=['xlsx', 'xls', 'csv'], 
@@ -857,7 +856,6 @@ def main():
                         move_group_down(i)
                         st.rerun()
 
-                # Keyに {ver} を含めることで、JSONロード時に古いウィジェット状態を破棄して値を反映させる
                 input_val = c_input.text_input(
                     f"グループ {i+1} 対象番号",
                     value=grp['member_input'],
@@ -942,9 +940,8 @@ def main():
                 current_date = st.session_state.get(f"detail_date_{v}", "")
                 calculated = calculate_next_day_morning(current_date)
                 if calculated:
-                    # Session Stateの値を直接書き換えるには、次のrerunで反映させるために
-                    # 現在のconfig_versionに対応するキーの値を更新しておく必要がある
-                    st.session_state[f"detail_result_{v}"] = calculated
+                    # 結果発表日時を更新
+                    st.session_state['contest_details']['result'] = calculated
             
             col_d1, col_d2 = st.columns(2)
             date_val = col_d1.text_input("開催日時 (例: 2025年12月21日)", value=det_current['date'], key=f"detail_date_{ver}", on_change=on_date_change)
