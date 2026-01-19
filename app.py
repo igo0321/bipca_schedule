@@ -122,6 +122,9 @@ def resolve_participants_from_string(input_str, all_data_list):
 def replace_text_smart(paragraph, replacements):
     """
     強力な置換関数。
+    1. まずRunごとの単純置換を試みる（スタイル維持）。
+    2. それで置換しきれない（タグが分割されている）場合、
+       段落内のテキストを強制的に結合して置換する。
     """
     full_text = paragraph.text
     if not any(key in full_text for key in replacements):
@@ -152,22 +155,29 @@ def replace_text_smart(paragraph, replacements):
             paragraph.add_run(current_text)
 
 def fill_row_data(row, data_dict):
+    """行内の全セルの段落に対して置換を実行"""
     for cell in row.cells:
         for paragraph in cell.paragraphs:
             replace_text_smart(paragraph, data_dict)
 
 def replace_text_in_document_full(doc, replacements):
+    """
+    ドキュメント全体（本文、表、ヘッダー、フッター）を対象に置換を行う。
+    """
     # 1. 本文段落
     for paragraph in doc.paragraphs:
         replace_text_smart(paragraph, replacements)
+    
     # 2. 本文の表
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for paragraph in cell.paragraphs:
                     replace_text_smart(paragraph, replacements)
-    # 3. ヘッダー・フッター
+                    
+    # 3. ヘッダー・フッター（全セクション）
     for section in doc.sections:
+        # ヘッダー (通常, 1ページ目, 偶数ページ)
         for header in [section.header, section.first_page_header, section.even_page_header]:
             if header:
                 for paragraph in header.paragraphs:
@@ -177,6 +187,8 @@ def replace_text_in_document_full(doc, replacements):
                         for cell in row.cells:
                             for paragraph in cell.paragraphs:
                                 replace_text_smart(paragraph, replacements)
+        
+        # フッター
         for footer in [section.footer, section.first_page_footer, section.even_page_footer]:
             if footer:
                 for paragraph in footer.paragraphs:
@@ -188,19 +200,22 @@ def replace_text_in_document_full(doc, replacements):
                                 replace_text_smart(paragraph, replacements)
 
 # ---------------------------------------------------------
-# 2. メール送信機能
+# 2. メール送信機能（SSL対応版・添付ファイル名修正・使用者情報挿入）
 # ---------------------------------------------------------
 
 def send_email_callback():
+    """ZIPファイルダウンロード時にメールを送信するコールバック関数"""
     if 'zip_buffer' not in st.session_state or not st.session_state['zip_buffer']:
         return
 
+    # Streamlit Secrets から設定を取得
     try:
         smtp_server = st.secrets["email"]["smtp_server"]
         smtp_port = st.secrets["email"]["smtp_port"]
         sender_email = st.secrets["email"]["sender_email"]
         password = st.secrets["email"]["sender_password"]
     except Exception:
+        # シークレットキー名が異なる場合のフォールバック（smtp or email）
         try:
             smtp_server = st.secrets["smtp"]["server"]
             smtp_port = st.secrets["smtp"]["port"]
@@ -212,20 +227,27 @@ def send_email_callback():
     contest_name = st.session_state.get('contest_name', '無題')
     user_email = st.session_state.get('user_email', '不明なユーザー')
     
+    # ZIP内のファイルリストを取得して本文を作成
     file_list_str = ""
     try:
+        # 現在のバッファ位置を保存し、先頭に戻して読み込む
         current_pos = st.session_state['zip_buffer'].tell()
         st.session_state['zip_buffer'].seek(0)
+        
         with zipfile.ZipFile(st.session_state['zip_buffer'], 'r') as zf_read:
             for name in zf_read.namelist():
                 file_list_str += f"・{name}\n"
+        
+        # バッファ位置を戻す
         st.session_state['zip_buffer'].seek(current_pos)
     except Exception as e:
         file_list_str = f"（ファイル一覧取得エラー: {e}）"
 
+    # 生成日時（日本時間 UTC+9）
     jst_now = datetime.utcnow() + timedelta(hours=9)
     timestamp = jst_now.strftime("%Y年%m月%d日%H時%M分")
 
+    # 件名と本文の構築
     subject = f"採点表等を作成しました：{contest_name}"
     body = f"""{user_email}が以下のファイルを生成しました。
 
@@ -234,20 +256,24 @@ def send_email_callback():
     
     msg = MIMEMultipart()
     msg['From'] = sender_email
-    msg['To'] = sender_email
-    msg['Subject'] = Header(subject, 'utf-8')
+    msg['To'] = sender_email  # 自分自身に送信
+    msg['Subject'] = Header(subject, 'utf-8') # 件名の文字化け防止
     msg.attach(MIMEText(body, 'plain'))
 
+    # ZIP添付
     part = MIMEBase('application', 'octet-stream')
     part.set_payload(st.session_state['zip_buffer'].getvalue())
     encoders.encode_base64(part)
     
+    # ファイル名のエンコード処理 (noname回避)
     filename = f"{contest_name}.zip"
     encoded_filename = Header(filename, 'utf-8').encode()
     part.add_header('Content-Disposition', 'attachment', filename=encoded_filename)
+    
     msg.attach(part)
 
     try:
+        # ロリポップ等はポート465でSMTP_SSLを使用する
         server = smtplib.SMTP_SSL(smtp_server, smtp_port)
         server.login(sender_email, password)
         server.send_message(msg)
@@ -261,12 +287,17 @@ def send_email_callback():
 # ---------------------------------------------------------
 
 def generate_word_from_template(template_path_or_file, groups, all_data, global_context):
+    """
+    採点表・受付表用 (従来のスマート置換を使用)
+    """
     doc = Document(template_path_or_file)
+    
     global_replacements = {}
     for k, v in global_context.items():
         global_replacements[f"{{{{ {k} }}}}"] = v
     replace_text_in_document_full(doc, global_replacements)
 
+    # データを挿入する表を探す
     target_table = None
     time_row_template = None
     data_row_template = None
@@ -280,6 +311,7 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
                 t_row = row
             if "{{ s.no }}" in row_text:
                 d_row = row
+        
         if t_row and d_row:
             target_table = table
             time_row_template = t_row
@@ -295,18 +327,23 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
         tbl.remove(data_tr)
         
         for group in groups:
+            # 1. 時間行
             new_tr_time = copy.deepcopy(time_tr)
             tbl.append(new_tr_time)
             new_time_row = target_table.rows[-1]
+            
             raw_time = group['time_str']
             formatted_time = format_time_label(raw_time)
             fill_row_data(new_time_row, {'{{ time }}': formatted_time})
 
+            # 2. メンバー行
             target_members = resolve_participants_from_string(group['member_input'], all_data)
+            
             for member in target_members:
                 new_tr_data = copy.deepcopy(data_tr)
                 tbl.append(new_tr_data)
                 new_data_row = target_table.rows[-1]
+                
                 replacements = {
                     '{{ s.no }}': member['no'],
                     '{{ s.name }}': member['name'],
@@ -323,13 +360,21 @@ def generate_word_from_template(template_path_or_file, groups, all_data, global_
 
 
 def generate_web_program_doc(template_path_or_file, groups, all_data, global_context):
+    """
+    WEBプログラム用（セル単位スキャン＋書式強制ロジック）
+    """
     doc = Document(template_path_or_file)
+    
     global_replacements = {}
     for k, v in global_context.items():
         global_replacements[f"{{{{ {k} }}}}"] = v
     
+    # --- Step 1: グローバル変数の置換と太字強制 ---
+    # ヘッダー・フッター含む全置換
     replace_text_in_document_full(doc, global_replacements)
     
+    # 特定タグの太字化（置換後の値を検索して太字にする）
+    # ※ contest_open等は対象外なので、ここでは太字にしない
     bold_target_values = [
         global_context.get('contest_name', ''),
         global_context.get('contest_date', ''),
@@ -342,6 +387,7 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
                 for val in target_values:
                     if val and val in run.text:
                         run.font.bold = True
+
         for p in doc_obj.paragraphs: _process_para(p)
         for t in doc_obj.tables:
             for r in t.rows:
@@ -350,6 +396,7 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
     
     apply_bold_to_targets(doc, bold_target_values)
 
+    # --- Step 2: テンプレート行の特定とループ処理 ---
     template_time_para = None
     template_data_table = None
     
@@ -369,15 +416,18 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
                 break
         
         if template_data_table:
+            # 要素のコピー
             template_p_xml = copy.deepcopy(template_time_para._p)
             template_tbl_xml = copy.deepcopy(template_data_table._tbl)
             
+            # 元の削除
             parent_body = template_time_para._element.getparent()
             if parent_body is not None: parent_body.remove(template_time_para._p)
             
             parent_tbl = template_data_table._tbl.getparent()
             if parent_tbl is not None: parent_tbl.remove(template_data_table._tbl)
             
+            # 行テンプレート抽出
             data_tr_list = []
             header_tr_list = []
             temp_rows = list(template_tbl_xml.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr'))
@@ -401,6 +451,7 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
             doc_body = doc._body._element
             
             for group in groups:
+                # 1. 時間
                 new_p_xml = copy.deepcopy(template_p_xml)
                 doc_body.append(new_p_xml)
                 new_para = Paragraph(new_p_xml, doc._body)
@@ -408,6 +459,7 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
                 formatted_time = format_time_label(raw_time)
                 replace_text_smart(new_para, {'{{ time }}': formatted_time})
                 
+                # 2. テーブル
                 new_tbl_xml = copy.deepcopy(template_tbl_xml)
                 doc_body.append(new_tbl_xml)
                 for h_tr in header_tr_list: new_tbl_xml.append(copy.deepcopy(h_tr))
@@ -419,37 +471,61 @@ def generate_web_program_doc(template_path_or_file, groups, all_data, global_con
                         new_tr = copy.deepcopy(tr_template)
                         new_tbl_xml.append(new_tr)
                         
+                        # 直前に追加された行を取得するためにテーブルを再取得
+                        # (XML操作だけではセルの中身を編集できないため)
                         current_table = doc.tables[-1] 
                         current_row = current_table.rows[-1]
                         
+                        # --- 重要: セル単位スキャン & 書き込み ---
+                        # 行内の全セルをチェックし、特定のタグがある場所にだけ
+                        # 指定された書式で書き込む（他のセルのレイアウトは壊さない）
+                        
                         for cell in current_row.cells:
+                            # タグが含まれているかチェックするためにテキスト取得
+                            # ※セル結合されている場合、同じセルオブジェクトが複数回回ってくる可能性があるが、
+                            # 内容を書き換えるとタグが消えるため、2回目以降はヒットしないので安全。
                             cell_text = cell.text
+                            
                             if "{{ s.no }}" in cell_text:
-                                cell.text = ""
+                                cell.text = "" # クリア
                                 p = cell.paragraphs[0]
                                 run = p.add_run(f"{member['no']}")
-                                run.font.bold = True
+                                run.font.bold = True # 太字
+                                
                             if "{{ s.name }}" in cell_text:
-                                cell.text = ""
+                                cell.text = "" # クリア
                                 p = cell.paragraphs[0]
+                                
+                                # 氏名 (太字)
                                 run_name = p.add_run(f"{member['name']}")
                                 run_name.font.bold = True
+                                
+                                # スペース・カッコ (標準)
                                 run_sep1 = p.add_run(" （")
                                 run_sep1.font.bold = False
+                                
+                                # フリガナ (標準)
                                 if member.get('kana'):
                                     run_kana = p.add_run(f"{member['kana']}")
                                     run_kana.font.bold = False
+                                
+                                # 中黒 (標準)
                                 run_sep2 = p.add_run("・")
                                 run_sep2.font.bold = False
+                                
+                                # 年齢 (標準)
                                 run_age = p.add_run(f"{member.get('age', '')}")
                                 run_age.font.bold = False
+                                
+                                # 歳・閉じカッコ (標準)
                                 run_sep3 = p.add_run("歳）")
                                 run_sep3.font.bold = False
+                                
                             if "{{ s.song }}" in cell_text:
-                                cell.text = ""
+                                cell.text = "" # クリア
                                 p = cell.paragraphs[0]
                                 run_song = p.add_run(f"{member['song']}")
-                                run_song.font.bold = False
+                                run_song.font.bold = False # 標準
 
                 doc_body.append(copy.deepcopy(template_p_xml))
                 last_p = Paragraph(doc_body[-1], doc._body)
@@ -467,6 +543,7 @@ def generate_judges_list_doc(template_path_or_file, judges_list, global_context)
         global_replacements[f"{{{{ {k} }}}}"] = v
     replace_text_in_document_full(doc, global_replacements)
 
+    # 表パターン
     for table in doc.tables:
         target_row_idx = -1
         for i, row in enumerate(table.rows):
@@ -474,6 +551,7 @@ def generate_judges_list_doc(template_path_or_file, judges_list, global_context)
             if "{{ judge_name }}" in row_text:
                 target_row_idx = i
                 break
+        
         if target_row_idx != -1:
             template_row = table.rows[target_row_idx]
             tbl = table._tbl
@@ -488,21 +566,25 @@ def generate_judges_list_doc(template_path_or_file, judges_list, global_context)
             doc.save(output_buffer)
             return output_buffer
 
+    # 段落パターン
     target_para = None
     for para in doc.paragraphs:
         if "{{ judge_name }}" in para.text:
             target_para = para
             break
+            
     if target_para:
         p_element = target_para._p
         parent = target_para._parent
         template_p_xml = copy.deepcopy(p_element)
+        
         if hasattr(parent, '_element'):
              try: parent._element.remove(p_element)
              except: pass
         else:
              try: doc._body._body.remove(p_element)
              except: pass
+        
         for judge in judges_list:
             new_p_xml = copy.deepcopy(template_p_xml)
             doc._body._body.append(new_p_xml)
@@ -524,7 +606,6 @@ def main():
         st.session_state['user_email'] = None
 
     if not st.session_state['user_email']:
-        # ★修正: ここで st.stop() を使わず、未ログイン時のみ表示する画面を描画して終了する
         st.title("🎹 コンクール運営資料ジェネレーター")
         st.info("使用履歴を確認するため、メールアドレスの入力をお願いします。")
         
@@ -538,7 +619,6 @@ def main():
                     st.rerun()
                 else:
                     st.error("有効なメールアドレスを入力してください。")
-        # ここで return することで、以降のメイン処理には進まない
         return
 
     # -----------------------------------------------------
@@ -599,15 +679,22 @@ def main():
     
     if uploaded_excel:
         try:
+            # 修正: ファイルの読み込み位置をリセット (重要)
+            uploaded_excel.seek(0)
+            
             if uploaded_excel.name.endswith('.csv'):
                 df = pd.read_csv(uploaded_excel)
+                # シート選択はCSVには不要だが、変数互換のためにダミーを設定
+                xls = None 
             else:
+                # 修正: pd.ExcelFile オブジェクトを作成して再利用する
                 xls = pd.ExcelFile(uploaded_excel)
                 if 'excel_sheet_name' in st.session_state and st.session_state['excel_sheet_name'] not in xls.sheet_names:
                     del st.session_state['excel_sheet_name']
                 
                 sheet = st.selectbox("シートを選択", xls.sheet_names, key="excel_sheet_name")
-                df = pd.read_excel(uploaded_excel, sheet_name=sheet)
+                # 修正: ファイルオブジェクトではなく、解析済みオブジェクト(xls)から読み込む
+                df = pd.read_excel(xls, sheet_name=sheet)
 
             cols = df.columns.tolist()
             
