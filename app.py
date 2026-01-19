@@ -523,36 +523,29 @@ def generate_judges_list_doc(template_path_or_file, judges_list, global_context)
     return output_buffer
 
 # ---------------------------------------------------------
-# 4. 設定ロード用関数（重要）
+# 4. 設定ロード用関数（Versioned Keys対応）
 # ---------------------------------------------------------
 
 def load_settings_from_json(json_data):
     """
-    JSONデータを読み込み、StreamlitのSession StateとWidget Keyに値を反映させる。
+    JSONデータを読み込み、StreamlitのSession Stateに反映させる。
+    Config Versionをインクリメントすることで、ウィジェットの強制リフレッシュを行う。
     """
     # 1. 基本データ
     st.session_state['groups'] = json_data.get('groups', [])
     st.session_state['judges'] = json_data.get('judges', [""])
     st.session_state['contest_name'] = json_data.get('contest_name', '')
     
-    # 2. 詳細設定 (Widget Keyとの同期)
-    # contest_details辞書そのものを更新
+    # 2. 詳細設定
     details = json_data.get('contest_details', {})
     st.session_state['contest_details'] = details
-    
-    # 各WidgetのKeyにも値をセットする (これで画面上の空欄化を防ぐ)
-    if 'date' in details: st.session_state['detail_date'] = details['date']
-    if 'hall' in details: st.session_state['detail_hall'] = details['hall']
-    if 'open' in details: st.session_state['detail_open'] = details['open']
-    if 'start' in details: st.session_state['detail_start'] = details['start']
-    if 'end' in details: st.session_state['detail_end'] = details['end']
-    if 'reception' in details: st.session_state['detail_reception'] = details['reception']
-    if 'result' in details: st.session_state['detail_result'] = details['result']
-    if 'method' in details: st.session_state['detail_method'] = details['method']
     
     # 3. Excel設定 (後でExcelロード時に使用するため保存)
     if 'excel_config' in json_data:
         st.session_state['saved_excel_config'] = json_data['excel_config']
+    
+    # 4. バージョン更新（これにより、全ウィジェットのkeyが変わり、値が再読込される）
+    st.session_state['config_version'] += 1
 
 # ---------------------------------------------------------
 # 5. メインアプリケーションUI
@@ -561,6 +554,8 @@ def main():
     st.set_page_config(layout="wide", page_title="コンクール資料作成")
     
     # 初期化
+    if 'config_version' not in st.session_state:
+        st.session_state['config_version'] = 0
     if 'groups' not in st.session_state:
         st.session_state['groups'] = [{'member_input': '', 'time_str': '13:00-14:10'}]
     if 'judges' not in st.session_state:
@@ -597,23 +592,26 @@ def main():
     st.title("🎹 コンクール運営資料ジェネレーター (Word版)")
     st.markdown(f"**ログイン中:** {st.session_state['user_email']}")
     
+    # バージョン番号の取得（ウィジェットKey生成用）
+    ver = st.session_state['config_version']
+
     # --- サイドバー: 設定読み込み ---
     with st.sidebar:
         st.header("⚙️ 設定管理")
-        uploaded_config = st.file_uploader("設定ファイル(JSON)を読み込む", type=['json'])
+        uploaded_config = st.file_uploader("設定ファイル(JSON)を読み込む", type=['json'], key=f"uploader_{ver}")
         if uploaded_config:
             try:
                 uploaded_config.seek(0)
                 config_data = json.load(uploaded_config)
-                # 専用のロード関数を使用
                 load_settings_from_json(config_data)
-                st.success("設定を復元しました")
+                st.success("設定を復元しました（画面が更新されます）")
+                st.rerun()
             except Exception as e:
                 st.error(f"設定読み込みエラー: {e}")
 
     # --- 1. 名簿データ (Excel) ---
     st.header("1. 名簿データ (Excel)")
-    uploaded_excel = st.file_uploader("名簿Excelファイルをアップロード", type=['xlsx', 'xls', 'csv'])
+    uploaded_excel = st.file_uploader("名簿Excelファイルをアップロード", type=['xlsx', 'xls', 'csv'], key=f"excel_up_{ver}")
     
     all_data = []
     excel_config_to_save = {}
@@ -639,7 +637,7 @@ def main():
                 if saved_sheet and saved_sheet in sheet_names:
                     default_sheet_idx = sheet_names.index(saved_sheet)
                 
-                selected_sheet = st.selectbox("シートを選択", sheet_names, index=default_sheet_idx)
+                selected_sheet = st.selectbox("シートを選択", sheet_names, index=default_sheet_idx, key=f"sheet_sel_{ver}")
                 df = pd.read_excel(uploaded_excel, sheet_name=selected_sheet)
 
             # Excel設定保存用
@@ -648,31 +646,27 @@ def main():
             # --- 列の割り当てロジック (保存された設定の優先使用) ---
             cols = df.columns.tolist()
             
-            # Helper: 列名のインデックスを探す（設定値 > 名前一致 > デフォルト）
             def get_col_index(saved_key, default_heuristic_cols, all_cols, fallback_index=0):
                 # 1. 保存された設定があればそれを使う
                 if saved_config and saved_key in saved_config:
                     val = saved_config[saved_key]
                     if val in all_cols:
                         return all_cols.index(val)
-                
-                # 2. ヒューリスティック（名前一致）
+                # 2. ヒューリスティック
                 for h in default_heuristic_cols:
                     if h in all_cols:
                         return all_cols.index(h)
-                
                 # 3. フォールバック
                 return fallback_index
 
             c1, c2, c3, c4 = st.columns(4)
             
             idx_no = get_col_index('col_no', ["出場番号", "No", "No."], cols, 0)
-            col_no = c1.selectbox("出場番号", cols, index=idx_no)
+            col_no = c1.selectbox("出場番号", cols, index=idx_no, key=f"c_no_{ver}")
 
             idx_name = get_col_index('col_name', ["氏名", "名前"], cols, 0)
-            col_name = c2.selectbox("氏名", cols, index=idx_name)
+            col_name = c2.selectbox("氏名", cols, index=idx_name, key=f"c_name_{ver}")
             
-            # フリガナなどは "(なし)" を含むため処理を分ける
             kana_options = ["(なし)"] + cols
             idx_kana = 0
             if saved_config and 'col_kana' in saved_config:
@@ -680,11 +674,10 @@ def main():
                     idx_kana = kana_options.index(saved_config['col_kana'])
             elif "フリガナ" in cols:
                 idx_kana = cols.index("フリガナ") + 1
-            
-            col_kana = c3.selectbox("フリガナ (任意)", kana_options, index=idx_kana)
+            col_kana = c3.selectbox("フリガナ (任意)", kana_options, index=idx_kana, key=f"c_kana_{ver}")
             
             idx_song = get_col_index('col_song', ["演奏曲目", "曲目"], cols, 0)
-            col_song = c4.selectbox("演奏曲目", cols, index=idx_song)
+            col_song = c4.selectbox("演奏曲目", cols, index=idx_song, key=f"c_song_{ver}")
             
             c5, c6, c7 = st.columns(3)
             
@@ -694,7 +687,7 @@ def main():
                  if saved_config['col_age'] in age_options: idx_age = age_options.index(saved_config['col_age'])
             elif "年齢" in cols:
                  idx_age = cols.index("年齢") + 1
-            col_age = c5.selectbox("年齢列 (任意)", age_options, index=idx_age)
+            col_age = c5.selectbox("年齢列 (任意)", age_options, index=idx_age, key=f"c_age_{ver}")
 
             tel_options = ["(なし)"] + cols
             idx_tel = 0
@@ -702,7 +695,7 @@ def main():
                  if saved_config['col_tel'] in tel_options: idx_tel = tel_options.index(saved_config['col_tel'])
             elif "電話番号" in cols:
                  idx_tel = cols.index("電話番号") + 1
-            col_tel = c6.selectbox("電話番号列 (受付表用)", tel_options, index=idx_tel)
+            col_tel = c6.selectbox("電話番号列 (受付表用)", tel_options, index=idx_tel, key=f"c_tel_{ver}")
 
             dur_options = ["(なし)"] + cols
             idx_dur = 0
@@ -710,9 +703,8 @@ def main():
                  if saved_config['col_duration'] in dur_options: idx_dur = dur_options.index(saved_config['col_duration'])
             elif "演奏時間" in cols:
                  idx_dur = cols.index("演奏時間") + 1
-            col_duration = c7.selectbox("演奏時間列 (自動計算用)", dur_options, index=idx_dur)
+            col_duration = c7.selectbox("演奏時間列 (自動計算用)", dur_options, index=idx_dur, key=f"c_dur_{ver}")
 
-            # 設定保存用辞書に記録
             excel_config_to_save.update({
                 'col_no': col_no,
                 'col_name': col_name,
@@ -729,7 +721,6 @@ def main():
                 kana_val = str(row[col_kana]) if col_kana != "(なし)" else ""
                 age_val = str(row[col_age]) if col_age != "(なし)" else ""
                 tel_val = str(row[col_tel]) if col_tel != "(なし)" else ""
-                
                 dur_seconds = 0
                 if col_duration != "(なし)":
                     raw_dur = str(row[col_duration])
@@ -759,7 +750,6 @@ def main():
             reception_template_path = None
             web_template_path = None
             judges_list_template_path = None
-            
             use_manual_upload = False
 
             if template_files:
@@ -777,22 +767,19 @@ def main():
                 col_t3, col_t4 = st.columns(2)
                 
                 with col_t1:
-                    selected_score_file = st.selectbox("採点表テンプレート", template_files, index=idx_score)
+                    selected_score_file = st.selectbox("採点表テンプレート", template_files, index=idx_score, key=f"tpl_sc_{ver}")
                     score_template_path = os.path.join(TEMPLATE_DIR, selected_score_file)
-                
                 with col_t2:
-                    selected_reception_file = st.selectbox("受付表テンプレート", template_files, index=idx_reception)
+                    selected_reception_file = st.selectbox("受付表テンプレート", template_files, index=idx_reception, key=f"tpl_rc_{ver}")
                     reception_template_path = os.path.join(TEMPLATE_DIR, selected_reception_file)
-                
                 with col_t3:
-                    selected_web_file = st.selectbox("WEBプログラムテンプレート", template_files, index=idx_web)
+                    selected_web_file = st.selectbox("WEBプログラムテンプレート", template_files, index=idx_web, key=f"tpl_wb_{ver}")
                     web_template_path = os.path.join(TEMPLATE_DIR, selected_web_file)
-
                 with col_t4:
-                    selected_judges_file = st.selectbox("審査員リストテンプレート", template_files, index=idx_judges)
+                    selected_judges_file = st.selectbox("審査員リストテンプレート", template_files, index=idx_judges, key=f"tpl_jd_{ver}")
                     judges_list_template_path = os.path.join(TEMPLATE_DIR, selected_judges_file)
                 
-                if st.checkbox("テンプレートを手動でアップロードする"):
+                if st.checkbox("テンプレートを手動でアップロードする", key=f"chk_manual_{ver}"):
                     use_manual_upload = True
             else:
                 st.warning("templatesフォルダが見つからないか、docxファイルがありません。手動アップロードモードに切り替えます。")
@@ -801,50 +788,48 @@ def main():
             if use_manual_upload:
                 c_up1, c_up2 = st.columns(2)
                 c_up3, c_up4 = st.columns(2)
-                uploaded_score_template = c_up1.file_uploader("採点表テンプレート (.docx)", type=['docx'])
-                uploaded_reception_template = c_up2.file_uploader("受付表テンプレート (.docx)", type=['docx'])
-                uploaded_web_template = c_up3.file_uploader("WEBプログラムテンプレート (.docx)", type=['docx'])
-                uploaded_judges_template = c_up4.file_uploader("審査員リストテンプレート (.docx)", type=['docx'])
+                uploaded_score_template = c_up1.file_uploader("採点表テンプレート (.docx)", type=['docx'], key=f"up_sc_{ver}")
+                uploaded_reception_template = c_up2.file_uploader("受付表テンプレート (.docx)", type=['docx'], key=f"up_rc_{ver}")
+                uploaded_web_template = c_up3.file_uploader("WEBプログラムテンプレート (.docx)", type=['docx'], key=f"up_wb_{ver}")
+                uploaded_judges_template = c_up4.file_uploader("審査員リストテンプレート (.docx)", type=['docx'], key=f"up_jd_{ver}")
                 
                 if uploaded_score_template: score_template_path = uploaded_score_template
                 if uploaded_reception_template: reception_template_path = uploaded_reception_template
                 if uploaded_web_template: web_template_path = uploaded_web_template
                 if uploaded_judges_template: judges_list_template_path = uploaded_judges_template
 
-            # --- 3. グループ・スケジュール設定 ---
+            # --- 3. グループ・スケジュール設定 (Dynamic Key Implemented) ---
             st.header("3. グループ・スケジュール設定")
             
             def add_group():
                 st.session_state['groups'].append({'member_input': '', 'time_str': ''})
-            
             def move_group_up(idx):
                 if idx > 0:
                     st.session_state['groups'][idx], st.session_state['groups'][idx-1] = st.session_state['groups'][idx-1], st.session_state['groups'][idx]
-
             def move_group_down(idx):
                 if idx < len(st.session_state['groups']) - 1:
                     st.session_state['groups'][idx], st.session_state['groups'][idx+1] = st.session_state['groups'][idx+1], st.session_state['groups'][idx]
-            
             def remove_group(idx):
                 st.session_state['groups'].pop(idx)
 
-            st.button("＋ グループ追加", on_click=add_group)
+            st.button("＋ グループ追加", on_click=add_group, key=f"btn_add_grp_{ver}")
 
             for i, grp in enumerate(st.session_state['groups']):
                 c_sort, c_input, c_total, c_time, c_del = st.columns([0.8, 3, 1.2, 2, 0.5])
                 
                 with c_sort:
-                    if st.button("▲", key=f"up_{i}"):
+                    if st.button("▲", key=f"up_{i}_{ver}"):
                         move_group_up(i)
                         st.rerun()
-                    if st.button("▼", key=f"down_{i}"):
+                    if st.button("▼", key=f"down_{i}_{ver}"):
                         move_group_down(i)
                         st.rerun()
 
+                # Keyに {ver} を含めることで、JSONロード時に古いウィジェット状態を破棄して値を反映させる
                 input_val = c_input.text_input(
                     f"グループ {i+1} 対象番号",
                     value=grp['member_input'],
-                    key=f"g_in_{i}",
+                    key=f"g_in_{i}_{ver}",
                     placeholder="例: A01-A05, C01"
                 )
                 st.session_state['groups'][i]['member_input'] = input_val
@@ -880,89 +865,84 @@ def main():
                 time_val = c_time.text_input(
                     "時間",
                     value=grp['time_str'],
-                    key=f"g_time_{i}",
+                    key=f"g_time_{i}_{ver}",
                     placeholder="例: 13:00-14:00"
                 )
                 st.session_state['groups'][i]['time_str'] = time_val
 
                 with c_del:
                     st.markdown("<div style='margin-top: 1.8rem;'></div>", unsafe_allow_html=True)
-                    if st.button("×", key=f"del_{i}"):
+                    if st.button("×", key=f"del_{i}_{ver}"):
                         remove_group(i)
                         st.rerun()
 
-            # --- 4. 審査員設定 (修正版) ---
+            # --- 4. 審査員設定 (Dynamic Key Implemented) ---
             st.header("4. 審査員設定")
             
-            # 審査員リスト操作用のコールバック
             def add_judge():
                 st.session_state['judges'].append("")
             
-            # UI
-            st.button("＋ 審査員追加", on_click=add_judge)
+            st.button("＋ 審査員追加", on_click=add_judge, key=f"btn_add_jdg_{ver}")
 
-            # 更新ループ
-            # リストを直接編集するのではなく、入力値をSession Stateに反映させる
+            # ループでウィジェット生成。Keyにverを含めることで、JSONロード時に強制リフレッシュ
             for i in range(len(st.session_state['judges'])):
-                # keyを一意にする
                 val = st.text_input(
                     f"審査員 {i+1}", 
                     value=st.session_state['judges'][i], 
-                    key=f"judge_input_{i}" 
+                    key=f"judge_input_{i}_{ver}" 
                 )
                 st.session_state['judges'][i] = val
 
-            # コンクール名
-            # session_state['contest_name'] を初期値として使い、入力があれば更新
             contest_name = st.text_input("コンクール名 (ファイル名等に使用)", 
-                                         value=st.session_state.get('contest_name', "第10回BIPCA 東京予選④"),
-                                         key="input_contest_name")
+                                         value=st.session_state['contest_name'],
+                                         key=f"input_contest_name_{ver}")
             st.session_state['contest_name'] = contest_name
 
-            # --- 5. 審査会詳細 (Keyバインディング修正) ---
+            # --- 5. 審査会詳細 (Dynamic Key Implemented) ---
             st.header("5. 審査会詳細")
             st.info("※ここで入力した内容はWord出力時に自動的に形式変換されて挿入されます。")
             
-            # 一時変数ではなくSessionStateを直接参照・更新するようにキーを設定
-            
+            det_current = st.session_state['contest_details']
+
             def on_date_change():
-                current_date = st.session_state['detail_date']
+                # Dynamic Keyから現在の値を取得して計算
+                v = st.session_state['config_version']
+                current_date = st.session_state.get(f"detail_date_{v}", "")
                 calculated = calculate_next_day_morning(current_date)
                 if calculated:
-                    st.session_state['detail_result'] = calculated
-                    st.session_state['contest_details']['result'] = calculated
-
+                    # Session Stateの値を直接書き換えるには、次のrerunで反映させるために
+                    # 現在のconfig_versionに対応するキーの値を更新しておく必要がある
+                    st.session_state[f"detail_result_{v}"] = calculated
+            
             col_d1, col_d2 = st.columns(2)
-            # key="detail_date" とすることで、load_settings でセットした値が反映される
-            date_val = col_d1.text_input("開催日時 (例: 2025年12月21日)", key="detail_date", on_change=on_date_change)
-            hall_val = col_d2.text_input("会場", key="detail_hall")
+            date_val = col_d1.text_input("開催日時 (例: 2025年12月21日)", value=det_current['date'], key=f"detail_date_{ver}", on_change=on_date_change)
+            hall_val = col_d2.text_input("会場", value=det_current['hall'], key=f"detail_hall_{ver}")
             
             col_d3, col_d4, col_d5, col_d6 = st.columns(4)
-            open_val = col_d3.text_input("開場時刻 (例: 10:00)", key="detail_open")
-            start_val = col_d4.text_input("審査開始 (例: 11:00)", key="detail_start")
-            end_val = col_d5.text_input("審査終了 (例: 14:00)", key="detail_end")
-            reception_val = col_d6.text_input("受付時間 (例: 10:45-15:30)", key="detail_reception")
+            open_val = col_d3.text_input("開場時刻 (例: 10:00)", value=det_current['open'], key=f"detail_open_{ver}")
+            start_val = col_d4.text_input("審査開始 (例: 11:00)", value=det_current['start'], key=f"detail_start_{ver}")
+            end_val = col_d5.text_input("審査終了 (例: 14:00)", value=det_current['end'], key=f"detail_end_{ver}")
+            reception_val = col_d6.text_input("受付時間 (例: 10:45-15:30)", value=det_current['reception'], key=f"detail_reception_{ver}")
 
             col_d7, col_d8 = st.columns(2)
-            result_val = col_d7.text_input("結果発表日時 (自動計算)", key="detail_result")
+            result_val = col_d7.text_input("結果発表日時 (自動計算)", value=det_current['result'], key=f"detail_result_{ver}")
             
             method_options = ["公式サイト上で掲載", "会場ロビーもしくはホワイエで掲載", "表彰式にて発表", "その他"]
-            # セッションステートの値が選択肢にあるか確認
-            current_method = st.session_state.get('detail_method', "公式サイト上で掲載")
-            idx_method = method_options.index(current_method) if current_method in method_options else 0
-            method_val = col_d8.selectbox("結果発表方式", method_options, index=idx_method, key="detail_method_box")
+            curr_method = det_current.get('method', "公式サイト上で掲載")
+            idx_method = method_options.index(curr_method) if curr_method in method_options else 0
+            method_val = col_d8.selectbox("結果発表方式", method_options, index=idx_method, key=f"detail_method_{ver}")
 
-            # 入力値を辞書にまとめておく（保存・生成用）
-            det = {
+            # 最新の入力値を保存用辞書に格納
+            det_updated = {
                 'date': date_val, 'hall': hall_val, 
                 'open': open_val, 'start': start_val, 'end': end_val, 
                 'reception': reception_val, 'result': result_val, 'method': method_val
             }
-            st.session_state['contest_details'] = det # 念のため更新
+            st.session_state['contest_details'] = det_updated
 
             # --- 6. ファイル出力 ---
             st.header("6. ファイル出力")
-            if st.button("ファイル生成を実行", type="primary"):
+            if st.button("ファイル生成を実行", type="primary", key=f"btn_gen_{ver}"):
                 # バリデーション
                 assigned_nos = []
                 for grp in st.session_state['groups']:
@@ -995,23 +975,23 @@ def main():
                 valid_judges = [j for j in st.session_state['judges'] if j.strip()]
                 
                 details_formatted = {
-                    'contest_date': det['date'],
-                    'contest_hall': det['hall'],
-                    'contest_open': format_single_time_label(det['open']),
-                    'contest_reception': format_time_label(det['reception']),
-                    'contest_start': format_single_time_label(det['start']),
-                    'contest_end': format_single_time_label(det['end']),
-                    'contest_result': det['result'],
-                    'contest_method': det['method']
+                    'contest_date': det_updated['date'],
+                    'contest_hall': det_updated['hall'],
+                    'contest_open': format_single_time_label(det_updated['open']),
+                    'contest_reception': format_time_label(det_updated['reception']),
+                    'contest_start': format_single_time_label(det_updated['start']),
+                    'contest_end': format_single_time_label(det_updated['end']),
+                    'contest_result': det_updated['result'],
+                    'contest_method': det_updated['method']
                 }
 
-                # Config JSON作成 (Excel設定を含める)
+                # Config JSON作成
                 config_json = json.dumps({
                     'groups': st.session_state['groups'],
                     'judges': valid_judges,
                     'contest_name': contest_name,
-                    'contest_details': det,
-                    'excel_config': excel_config_to_save # 追加: Excel設定
+                    'contest_details': det_updated,
+                    'excel_config': excel_config_to_save
                 }, ensure_ascii=False, indent=2)
 
                 zip_buffer = io.BytesIO()
@@ -1079,7 +1059,8 @@ def main():
                     data=st.session_state['zip_buffer'].getvalue(),
                     file_name=f"{contest_name}.zip",
                     mime="application/zip",
-                    on_click=send_email_callback
+                    on_click=send_email_callback,
+                    key=f"dl_btn_{ver}"
                 )
 
         except Exception as e:
