@@ -7,7 +7,7 @@ import re
 import os
 import copy
 import smtplib
-from collections import Counter # 追加: 重複チェック用
+from collections import Counter
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -632,11 +632,32 @@ def main():
         st.header("⚙️ 設定管理")
         uploaded_config = st.file_uploader("設定ファイル(JSON)を読み込む", type=['json'])
         if uploaded_config:
-            # 修正: ファイルポインタを先頭に戻す処理を追加
             uploaded_config.seek(0)
             config_data = json.load(uploaded_config)
+            
+            # 1. セッションステートの更新
             st.session_state.update(config_data)
+            
+            # 2. 【重要】古いウィジェット状態(Key)の削除
+            # これをやらないと、Streamlitは古い入力値を保持し続け、JSONの値が反映されない
+            keys_to_clear = []
+            for k in st.session_state.keys():
+                if k.startswith('judge_input_') or k.startswith('g_in_') or k.startswith('g_time_'):
+                    keys_to_clear.append(k)
+            
+            for k in keys_to_clear:
+                del st.session_state[k]
+            
+            # 3. コンクール名や日付など、個別のKeyへの値セット
+            if 'contest_name' in config_data:
+                st.session_state['contest_name_key'] = config_data['contest_name']
+            
+            if 'contest_details' in config_data:
+                 if 'date' in config_data['contest_details']:
+                     st.session_state['detail_date'] = config_data['contest_details']['date']
+
             st.success("設定を復元しました")
+            st.rerun() # 画面をリロードして反映
 
     # --- 1. Excelアップロード ---
     st.header("1. 名簿データ (Excel)")
@@ -795,9 +816,10 @@ def main():
                         move_group_down(i)
                         st.rerun()
 
+                # valueをsession_stateから取るようにする
                 input_val = c_input.text_input(
                     f"グループ {i+1} 対象番号",
-                    value=grp['member_input'],
+                    value=st.session_state['groups'][i]['member_input'],
                     key=f"g_in_{i}",
                     placeholder="例: A01-A05, C01"
                 )
@@ -833,7 +855,7 @@ def main():
 
                 time_val = c_time.text_input(
                     "時間",
-                    value=grp['time_str'],
+                    value=st.session_state['groups'][i]['time_str'],
                     key=f"g_time_{i}",
                     placeholder="例: 13:00-14:00"
                 )
@@ -855,11 +877,17 @@ def main():
                 st.rerun()
 
             for i in range(len(st.session_state['judges'])):
-                val = st.text_input(f"審査員 {i+1}", value=st.session_state['judges'][i], key=f"judge_input_{i}")
+                val = st.text_input(
+                    f"審査員 {i+1}", 
+                    value=st.session_state['judges'][i], 
+                    key=f"judge_input_{i}"
+                )
                 st.session_state['judges'][i] = val
 
-            contest_name = st.text_input("コンクール名 (ファイル名等に使用)", "第10回BIPCA 東京予選④")
-            st.session_state['contest_name'] = contest_name # セッションに保存(メール件名用)
+            # コンクール名 (Key紐付け & 同期)
+            contest_name_val = st.session_state.get('contest_name', "第10回BIPCA 東京予選④")
+            contest_name = st.text_input("コンクール名 (ファイル名等に使用)", value=contest_name_val, key="contest_name_key")
+            st.session_state['contest_name'] = contest_name 
 
             # --- 5. 審査会詳細 ---
             st.header("5. 審査会詳細")
@@ -902,7 +930,7 @@ def main():
             # --- 6. ファイル出力 ---
             st.header("6. ファイル出力")
             if st.button("ファイル生成を実行", type="primary"):
-                # --- NEW: Validation Logic ---
+                # --- Validation Logic ---
                 
                 # 1. Collect all assigned numbers from groups
                 assigned_nos = []
